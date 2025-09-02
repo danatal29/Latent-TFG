@@ -32,6 +32,7 @@ models/
 *.npz
 *.npy
 *.pyc
+
 # Secrets
 *.pem
 *.key
