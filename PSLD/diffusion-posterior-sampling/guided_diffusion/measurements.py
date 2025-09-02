@@ -6,11 +6,14 @@ import yaml
 import numpy as np
 from PIL import Image
 from torch.nn import functional as F
-from torchvision import torch
+import torch
 from motionblur.motionblur import Kernel
 
 from util.resizer import Resizer
 from util.img_utils import Blurkernel, fft2_m
+# For PIL images, convert to tensor first
+import torchvision.transforms as T
+
 
 
 
@@ -190,17 +193,41 @@ class StyleOperator(NonLinearOperator):
         return G.reshape(B, -1)     
 
     
-    def style_vec(self, pil_img, layers=[-1], use_adain=False):
+    def style_vec(self, img_tensor, layers=[-1], use_adain=False):
         """
         pil_img -> normalized style vector from multiple hidden states.
         `layers` are indices into hidden_states (negative = from the end).
         """
-        inputs = self.processor(images=pil_img, return_tensors="pt").to(self.device)
-        if pil_img.requires_grad:
-            out = self.model(**inputs, output_hidden_states=True)
+        #inputs = self.processor(images=pil_img, return_tensors="pt").to(self.device)
+        
+        # 1. Differentiable Resizing
+        # DINOv2 expects a 224x224 input.
+        # The image tensor is in the range [0, 1] after the clamp operation.
+        # Use F.interpolate instead of T.Resize to avoid MPS issues
+        if img_tensor.shape[-1] != 224 or img_tensor.shape[-2] != 224:
+            if img_tensor.dim() == 3:
+                img_tensor = img_tensor.unsqueeze(0)  # Add batch dimension
+            img_tensor = F.interpolate(img_tensor, size=(224, 224), mode='bilinear', align_corners=False)
+            if img_tensor.shape[0] == 1:
+                img_tensor = img_tensor.squeeze(0)  # Remove batch dimension if it was added
+
+        # 2. Differentiable Normalization
+        # DINOv2's mean and std
+        norm_mean = torch.tensor([0.485, 0.456, 0.406], device=img_tensor.device).view(1, 3, 1, 1)
+        norm_std = torch.tensor([0.229, 0.224, 0.225], device=img_tensor.device).view(1, 3, 1, 1)
+        
+        # Apply normalization to the tensor
+        inputs = (img_tensor - norm_mean) / norm_std
+
+        # Ensure we have batch dimension
+        if inputs.dim() == 3:
+            inputs = inputs.unsqueeze(0)  # [C, H, W] -> [1, C, H, W]
+
+        if img_tensor.requires_grad:
+            out = self.model(inputs, output_hidden_states=True)
         else:
             with torch.no_grad():
-                out = self.model(**inputs, output_hidden_states=True)
+                out = self.model(inputs, output_hidden_states=True)
         hs_list = [out.hidden_states[i] for i in layers]   # each: [B, N+1, C]
         parts = []
         for hs in hs_list:
@@ -219,9 +246,6 @@ class StyleOperator(NonLinearOperator):
 
         
 
-
-
-
     def forward(self, data, **kwargs):
         # For differentiable operations, we need to handle tensors directly
         if torch.is_tensor(data):
@@ -233,8 +257,8 @@ class StyleOperator(NonLinearOperator):
             
             # For differentiable style extraction, we'll use a simplified approach
             # that maintains the computational graph
-            if data.dim() == 4:  # Batch dimension
-                data = data[0]  # Take first image if batch
+            if data.dim() == 3:
+                data = data.unsqueeze(0) 
             
             # Use a differentiable style extraction method
             style_vec = self.style_vec(data, **kwargs)
@@ -244,46 +268,7 @@ class StyleOperator(NonLinearOperator):
             style_vec = self.style_vec(data, **kwargs)
             return style_vec
     
-    def differentiable_style_vec(self, tensor_img, layers=[-1], use_adain=False):
-        """
-        Differentiable version of style extraction that maintains computational graph.
-        This uses a simplified approach that works with tensors directly.
-        """
-        # Normalize the image for processing
-        if tensor_img.min() < 0 or tensor_img.max() > 1:
-            tensor_img = torch.clamp(tensor_img, 0, 1)
-        
-        # Resize to expected input size if needed (DINOv2 expects 224x224)
-        if tensor_img.shape[-1] != 224 or tensor_img.shape[-2] != 224:
-            tensor_img = F.interpolate(tensor_img.unsqueeze(0), size=(224, 224), mode='bilinear', align_corners=False).squeeze(0)
-        
-        # Convert tensor to PIL for DINOv2 processing
-        # We need to do this carefully to maintain gradients
-        tensor_img_np = tensor_img.permute(1, 2, 0).detach().cpu().numpy()
-        pil_img = Image.fromarray((tensor_img_np * 255).astype(np.uint8))
-        
-        # Process with DINOv2 model
-        inputs = self.processor(images=pil_img, return_tensors="pt").to(self.device)
-        with torch.no_grad():
-            out = self.model(**inputs, output_hidden_states=True)
-        
-        # Extract features from specified layers
-        hs_list = [out.hidden_states[i] for i in layers]
-        parts = []
-        for hs in hs_list:
-            tok = hs[:, 1:, :]  # drop CLS
-            if use_adain:
-                # Simple AdaIN implementation
-                mean = tok.mean(dim=1, keepdim=True)
-                std = tok.std(dim=1, keepdim=True) + 1e-8
-                part = (tok - mean) / std
-                part = part.reshape(part.shape[0], -1)
-            else:
-                part = StyleOperator.gram(tok, offdiag_only=True)
-            parts.append(part)
-        
-        v = torch.cat(parts, dim=1)
-        return F.normalize(v, dim=1)
+
 
     def transpose(self, data, **kwargs):
         """
@@ -437,3 +422,148 @@ class PoissonNoise(Noise):
         #     data = data * (old_max + 1.0) - 1.0
        
         # return data.clamp(low_clip, 1.0)
+@register_operator(name='clip_style_retrieval')
+class CLIPStyleOperator(NonLinearOperator):
+    def __init__(self, device=None):
+        if device is None:
+            self.device = torch.device("cuda" if torch.cuda.is_available()
+            else "mps" if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()
+            else "cpu")
+        else:
+            self.device = device
+
+        # Import CLIP model and processor
+        import clip
+        self.model, self.preprocess = clip.load("ViT-B/32", device=self.device)
+        self.model = self.model.eval()
+        
+        # Get the image encoder part
+        self.image_encoder = self.model.visual
+        
+        # Convert to float32 to avoid MPS type mismatches
+        self.image_encoder = self.image_encoder.float()
+        
+        # Freeze the model parameters
+        for param in self.image_encoder.parameters():
+            param.requires_grad = False
+
+    @staticmethod
+    def gram(tokens, offdiag_only=True):
+        # tokens: [B, N, C]
+        B, N, C = tokens.shape
+        X = tokens / (N ** 0.5)
+        G = X.transpose(1, 2) @ X     # [B, C, C]
+        if offdiag_only:
+            G = G - torch.diag_embed(torch.diagonal(G, dim1=1, dim2=2))
+        return G.reshape(B, -1)     
+
+    def style_vec(self, img_tensor, layers=[-1], use_adain=False):
+        """
+        Extract style features using CLIP's image encoder.
+        `layers` are indices into transformer layers (negative = from the end).
+        """
+        # 1. Differentiable Resizing and Preprocessing
+        # CLIP expects 224x224 input
+        if img_tensor.shape[-1] != 224 or img_tensor.shape[-2] != 224:
+            if img_tensor.dim() == 3:
+                img_tensor = img_tensor.unsqueeze(0)  # Add batch dimension
+            img_tensor = F.interpolate(img_tensor, size=(224, 224), mode='bilinear', align_corners=False)
+            if img_tensor.shape[0] == 1:
+                img_tensor = img_tensor.squeeze(0)  # Remove batch dimension if it was added
+
+        # 2. CLIP Normalization
+        # CLIP uses ImageNet normalization
+        norm_mean = torch.tensor([0.48145466, 0.4578275, 0.40821073], device=img_tensor.device).view(1, 3, 1, 1)
+        norm_std = torch.tensor([0.26862954, 0.26130258, 0.27577711], device=img_tensor.device).view(1, 3, 1, 1)
+        
+        # Apply normalization
+        inputs = (img_tensor - norm_mean) / norm_std
+        
+        # Ensure inputs are float32 to match CLIP model
+        inputs = inputs.float()
+
+        # Ensure we have batch dimension
+        if inputs.dim() == 3:
+            inputs = inputs.unsqueeze(0)  # [C, H, W] -> [1, C, H, W]
+
+        # Extract features from CLIP
+        if img_tensor.requires_grad:
+            # Get features from CLIP - use the standard forward pass
+            features = self.image_encoder(inputs)
+            
+            # For CLIP, we'll use the final output features
+            # CLIP doesn't provide intermediate layer access easily
+            if features.dim() == 3:
+                # If we get [B, N, C] features
+                if use_adain:
+                    # AdaIN normalization
+                    mean = features.mean(dim=1, keepdim=True)
+                    std = features.std(dim=1, keepdim=True) + 1e-8
+                    part = (features - mean) / std
+                    part = part.reshape(part.shape[0], -1)
+                else:
+                    # Gram matrix
+                    part = CLIPStyleOperator.gram(features, offdiag_only=True)
+            else:
+                # If features are 2D [B, C], flatten them
+                part = features.reshape(features.shape[0], -1)
+                
+        else:
+            with torch.no_grad():
+                features = self.image_encoder(inputs)
+                
+                if features.dim() == 3:
+                    if use_adain:
+                        mean = features.mean(dim=1, keepdim=True)
+                        std = features.std(dim=1, keepdim=True) + 1e-8
+                        part = (features - mean) / std
+                        part = part.reshape(part.shape[0], -1)
+                    else:
+                        part = CLIPStyleOperator.gram(features, offdiag_only=True)
+                else:
+                    part = features.reshape(features.shape[0], -1)
+
+        # Return normalized features
+        return F.normalize(part, dim=1)
+
+    def forward(self, data, **kwargs):
+        # Handle both tensor and PIL inputs
+        if torch.is_tensor(data):
+            # Convert from [-1, 1] to [0, 1] range
+            data = data.add(1.0).div(2.0).clamp(0.0, 1.0)
+            
+        if data.dim() == 3:
+            data = data.unsqueeze(0) 
+                
+            # Extract style features
+            style_vec = self.style_vec(data, **kwargs)
+            return style_vec
+        else:
+
+            transform = T.Compose([
+                T.Resize((224, 224)),
+                T.ToTensor(),
+                T.Normalize([0.48145466, 0.4578275, 0.40821073], 
+                           [0.26862954, 0.26130258, 0.27577711])
+            ])
+            img_tensor = transform(data).unsqueeze(0).to(self.device)
+            style_vec = self.style_vec(img_tensor, **kwargs)
+            return style_vec
+
+    def transpose(self, data, **kwargs):
+        """
+        For style operators, the transpose is the same as forward.
+        """
+        return self.forward(data, **kwargs)
+
+    def ortho_project(self, data, **kwargs):
+        """
+        Orthogonal projection: (I - A^T * A)X
+        """
+        return data - self.transpose(self.forward(data, **kwargs))
+
+    def project(self, data, measurement, **kwargs):
+        """
+        Projection: (I - A^T * A)Y - AX
+        """
+        return self.ortho_project(measurement, **kwargs) - self.forward(data, **kwargs)

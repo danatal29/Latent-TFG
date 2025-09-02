@@ -28,6 +28,18 @@ class DDIMSampler(object):
         self.ddpm_num_timesteps = model.num_timesteps
         self.schedule = schedule
         self.device = get_device()
+        
+        # Initialize TensorBoard logger
+        try:
+            from tensorboard_logger import get_tensorboard_logger
+            self.tensorboard_logger = get_tensorboard_logger(
+                experiment_name="psld_style_constraint"
+            )
+            self.log_step = 0
+        except ImportError:
+            print("Warning: tensorboard_logger not available, logging disabled")
+            self.tensorboard_logger = None
+            self.log_step = 0
 
     def register_buffer(self, name, attr):
         if type(attr) == torch.Tensor:
@@ -210,110 +222,15 @@ class DDIMSampler(object):
                       ip_mask=None, measurements = None, operator = None, gamma=1, inpainting=False,
                       gamma_scale = None, omega = 1e-1,
                       general_inverse=False,noiser=None,
-                      ffhq256=False, lr=0.01):
+                      ffhq256=False):
         b, *_, device = *x.shape, x.device
            
         ##########################################
         ## measurment consistency guided diffusion
         ##########################################
-        if inpainting:
-            # print('Running inpainting module...')
-            z_t = torch.clone(x.detach())
-            z_t.requires_grad = True
-            
-            if unconditional_conditioning is None or unconditional_guidance_scale == 1.:
-                e_t = self.model.apply_model(z_t, t, c)
-            else:
-                x_in = torch.cat([z_t] * 2)
-                t_in = torch.cat([t] * 2)
-                c_in = torch.cat([unconditional_conditioning, c])
-                e_t_uncond, e_t = self.model.apply_model(x_in, t_in, c_in).chunk(2)
-                e_t = e_t_uncond + unconditional_guidance_scale * (e_t - e_t_uncond)
-            
-            
-            if score_corrector is not None:
-                assert self.model.parameterization == "eps"
-                e_t = score_corrector.modify_score(self.model, e_t, z_t, t, c, **corrector_kwargs)
-            
-            
-            alphas = self.model.alphas_cumprod if use_original_steps else self.ddim_alphas
-            alphas_prev = self.model.alphas_cumprod_prev if use_original_steps else self.ddim_alphas_prev
-            sqrt_one_minus_alphas = self.model.sqrt_one_minus_alphas_cumprod if use_original_steps else self.ddim_sqrt_one_minus_alphas
-            sigmas = self.model.ddim_sigmas_for_original_num_steps if use_original_steps else self.ddim_sigmas
-            # select parameters corresponding to the currently considered timestep
-            a_t = torch.full((b, 1, 1, 1), alphas[index], device=device)
-            a_prev = torch.full((b, 1, 1, 1), alphas_prev[index], device=device)
-            sigma_t = torch.full((b, 1, 1, 1), sigmas[index], device=device)
-            sqrt_one_minus_at = torch.full((b, 1, 1, 1), sqrt_one_minus_alphas[index],device=device)
-            
-            # current prediction for x_0
-            pred_z_0 = (z_t - sqrt_one_minus_at * e_t) / a_t.sqrt()
-            
-            
-            if quantize_denoised:
-                pred_z_0, _, *_ = self.model.first_stage_model.quantize(pred_z_0)
-            
-            
-            # direction pointing to x_t
-            dir_zt = (1. - a_prev - sigma_t**2).sqrt() * e_t
-            noise = sigma_t * noise_like(x.shape, device, repeat_noise) * temperature
-            if noise_dropout > 0.:
-                noise = torch.nn.functional.dropout(noise, p=noise_dropout)
 
-            z_prev = a_prev.sqrt() * pred_z_0 + dir_zt + noise
-            
-            
-            ##############################################
-            image_pred = self.model.differentiable_decode_first_stage(pred_z_0)
-            meas_pred = operator.forward(image_pred,mask=ip_mask)
-            meas_pred = noiser(meas_pred)
-            
-            # Check if this is a style operator
-            if hasattr(operator, '__class__') and ('style' in operator.__class__.__name__.lower() or 'StyleOperator' in operator.__class__.__name__):
-                # For style extraction: use differentiable style loss
-                # This maintains the computational graph and allows gradient-based optimization
-                
-                # Extract target style features from measurements (these are the target style vectors)
-                target_style_features = measurements
-                
-                # Extract style features from the predicted image using the same method
-                pred_style_features = operator.forward(image_pred)
-                
-                # Compute L2 loss between predicted and target style features
-                style_loss = torch.linalg.norm(pred_style_features - target_style_features)
-                
-                # For style extraction: use only the style loss (no inpaint error)
-                error = style_loss * omega
-                
-                print(f'Style loss: {style_loss.item():.4f}')
-                
-                # Continue with gradient computation for style operators
-                # (no early return - let it proceed to gradient computation)
-                
-            else:
-                # For other operators: use L2 norm and projection
-                meas_error = torch.linalg.norm(meas_pred - measurements)
-                
-                ortho_project = image_pred - operator.transpose(operator.forward(image_pred, mask=ip_mask))
-                parallel_project = operator.transpose(measurements)
-                inpainted_image = parallel_project + ortho_project
-                
-                # pdb.set_trace()
-                # encoded_z_0 = self.model.encode_first_stage(inpainted_image) if ffhq256 else self.model.encode_first_stage(inpainted_image) 
-                encoded_z_0 = self.model.encode_first_stage(inpainted_image.type(torch.float32))
-                encoded_z_0 = self.model.get_first_stage_encoding(encoded_z_0)
-                inpaint_error = torch.linalg.norm(encoded_z_0 - pred_z_0)
-                
-                error = inpaint_error * gamma + meas_error * omega
-            gradients = torch.autograd.grad(error, inputs=z_t)[0]
-            # Add learning rate for stable gradient descent
-            lr = 0.01  # Adjust this value to control gradient step size
-            z_prev = z_prev - lr * gradients
-            print('Loss: ', error.item())
-            
-            return z_prev.detach(), pred_z_0.detach()
         
-        elif general_inverse:
+        if general_inverse:
             # print('Running general inverse module...')
             z_t = torch.clone(x.detach())
             z_t.requires_grad = True
@@ -363,7 +280,10 @@ class DDIMSampler(object):
             ##############################################
             image_pred = self.model.differentiable_decode_first_stage(pred_z_0)
             meas_pred = operator.forward(image_pred)
-            meas_pred = noiser(meas_pred)
+            if operator.name == 'clip_style_retrieval' or operator.name == 'style_retrieval':
+                pass
+            else:
+                meas_pred = noiser(meas_pred)
 
 
             # Check if this is a style operator
@@ -372,20 +292,31 @@ class DDIMSampler(object):
                 # This maintains the computational graph and allows gradient-based optimization
                 
                 # Extract target style features from measurements (these are the target style vectors)
-                target_style_features = measurements
+                target_style_features = measurements.detach()
                 
                 # Extract style features from the predicted image using the same method
                 pred_style_features = operator.forward(image_pred)
                 
-                # Compute L2 loss between predicted and target style features
-                #style_loss = torch.linalg.norm(pred_style_features - target_style_features)
-                pred = F.normalize(pred_style_features, dim=-1)
-                target = F.normalize(target_style_features, dim=-1)
-                style_loss = torch.norm(pred - target, dim=-1).mean()
-
+                # Compute cosine similarity loss for style features
+                # Normalize features for cosine similarity
+                pred_norm = F.normalize(pred_style_features, dim=-1)
+                target_norm = F.normalize(target_style_features, dim=-1)
                 
+                # Cosine similarity loss (1 - cosine_similarity)
+                cosine_sim = F.cosine_similarity(pred_norm, target_norm, dim=-1)
+                cosine_loss = (1.0 - cosine_sim).mean()  # Scale up cosine loss
+                
+                # Add L2 regularization to prevent overfitting
+                l2_reg = 0.1 * torch.norm(pred_style_features - target_style_features, p=2)
+                
+                # Combine both losses for better style transfer
+                style_loss = cosine_loss #+ l2_reg
+                
+                print(f'***Cosine similarity: {cosine_sim.mean().item():.3f}, Cosine loss: {cosine_loss.item():.3f}, L2 reg: {l2_reg.item():.3f}')
+
                 # For style extraction: use only the style loss (no inpaint error)
-                error = style_loss * omega
+                omega_t = omega * (1.0 - a_t).clamp(0,1).pow(2)
+                error = style_loss * omega_t
                 
                 print(f'Style loss: {style_loss.item():.4f}')
                 
@@ -408,10 +339,59 @@ class DDIMSampler(object):
                 error = inpaint_error * gamma + meas_error * omega
             
             gradients = torch.autograd.grad(error, inputs=z_t)[0]
-            # Add learning rate for stable gradient descent
-            lr = 0.01  # Adjust this value to control gradient step size
-            z_prev = z_prev - lr * gradients
-            print('Loss: ', error.item())
+            
+            # Adaptive learning rate based on gradient-to-parameter ratio
+            grad_norm = gradients.norm()
+            normalized_gradients = gradients / (grad_norm + 1e-8)
+            z_norm = z_prev.norm()
+            print(f'grad_NORM: {normalized_gradients.norm().item()}')
+            
+            # Calculate optimal learning rate: want gradient step to be ~1% of parameter norm (conservative)
+            target_step_size = z_norm * 0.005  # 1% of parameter norm (conservative)
+            print(f'Target_step_size: {target_step_size.item():.3f}')
+
+            target_frac = 5e-4                                     # tune 1e-4..1e-3
+            step = (target_frac * z_norm).clamp(1e-5, 1e-2)
+            step = step * (sigma_t / sigmas.max()).pow(2)
+
+
+
+            lr = (target_step_size * z_norm).clamp(1e-5, 1e-2)  # Adaptive based on gradient magnitude
+            print(f'LR: {lr.item():.3f}')
+            # Clamp learning rate to reasonable bounds (keep it small)
+            #lr = torch.clamp(lr, min=0.0001, max=0.5)  # Conservative bounds
+            
+            # Apply gradient update
+            z_prev = z_prev -  step * normalized_gradients
+            
+            # Calculate actual step size for monitoring
+            actual_step_size = step.item()
+            
+            print(f'Gradients: {gradients.norm().item():.6f}, Z_PREV: {z_prev.norm().item():.6f}')
+            print(f'Learning Rate: {lr.item():.3f}, Step Size: {actual_step_size:.3f}')
+            print(f'Loss: {error.item():.6f}')
+            
+            # Log metrics (handle both style and non-style operators)
+            if self.tensorboard_logger is not None:
+                metrics_to_log = {
+                    'loss/total_loss': error.item(),
+                    'optimization/learning_rate': lr.item(),
+                    'optimization/step_size': actual_step_size,
+                    'optimization/gradient_norm': grad_norm.item(),
+                    'optimization/parameter_norm': z_norm.item()
+                }
+                
+                # Add style loss if it exists (for style operators)
+                if 'style_loss' in locals():
+                    metrics_to_log['loss/style_loss'] = style_loss.item()
+                
+                self.tensorboard_logger.log_metrics(metrics_to_log, step=self.log_step)
+                # Log images every 10 steps
+                if self.log_step % 10 == 0:
+                    current_image = self.model.differentiable_decode_first_stage(pred_z_0)
+                    self.tensorboard_logger.log_image(current_image, step=self.log_step, every_n_steps=10)
+
+            self.log_step += 1
             
             return z_prev.detach(), pred_z_0.detach()
         
@@ -463,259 +443,6 @@ class DDIMSampler(object):
     
     ######################
 
-    def p_sample_ddim_copy(self, x, c, t, index, repeat_noise=False, use_original_steps=False, quantize_denoised=False,
-                      temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
-                      unconditional_guidance_scale=1., unconditional_conditioning=None,
-                      ip_mask=None, measurements = None, operator = None, gamma=1, inpainting=False,
-                      gamma_scale = None, omega = 1e-1,
-                      general_inverse=False,noiser=None,
-                      ffhq256=False):
-        b, *_, device = *x.shape, x.device
-           
-        ##########################################
-        ## measurment consistency guided diffusion
-        ###############################
-
-        if inpainting:
-            # print('Running inpainting module...')
-            z_t = torch.clone(x.detach())
-            z_t.requires_grad = True
-            
-            if unconditional_conditioning is None or unconditional_guidance_scale == 1.:
-                e_t = self.model.apply_model(z_t, t, c)
-            else:
-                x_in = torch.cat([z_t] * 2)
-                t_in = torch.cat([t] * 2)
-                c_in = torch.cat([unconditional_conditioning, c])
-                e_t_uncond, e_t = self.model.apply_model(x_in, t_in, c_in).chunk(2)
-                e_t = e_t_uncond + unconditional_guidance_scale * (e_t - e_t_uncond)
-            
-            
-            if score_corrector is not None:
-                assert self.model.parameterization == "eps"
-                e_t = score_corrector.modify_score(self.model, e_t, z_t, t, c, **corrector_kwargs)
-            
-            
-            alphas = self.model.alphas_cumprod if use_original_steps else self.ddim_alphas
-            alphas_prev = self.model.alphas_cumprod_prev if use_original_steps else self.ddim_alphas_prev
-            sqrt_one_minus_alphas = self.model.sqrt_one_minus_alphas_cumprod if use_original_steps else self.ddim_sqrt_one_minus_alphas
-            sigmas = self.model.ddim_sigmas_for_original_num_steps if use_original_steps else self.ddim_sigmas
-            # select parameters corresponding to the currently considered timestep
-            a_t = torch.full((b, 1, 1, 1), alphas[index], device=device)
-            a_prev = torch.full((b, 1, 1, 1), alphas_prev[index], device=device)
-            sigma_t = torch.full((b, 1, 1, 1), sigmas[index], device=device)
-            sqrt_one_minus_at = torch.full((b, 1, 1, 1), sqrt_one_minus_alphas[index],device=device)
-            
-            # current prediction for x_0
-            pred_z_0 = (z_t - sqrt_one_minus_at * e_t) / a_t.sqrt()
-            
-            
-            if quantize_denoised:
-                pred_z_0, _, *_ = self.model.first_stage_model.quantize(pred_z_0)
-            
-            
-            # direction pointing to x_t
-            dir_zt = (1. - a_prev - sigma_t**2).sqrt() * e_t
-            noise = sigma_t * noise_like(x.shape, device, repeat_noise) * temperature
-            if noise_dropout > 0.:
-                noise = torch.nn.functional.dropout(noise, p=noise_dropout)
-
-            z_prev = a_prev.sqrt() * pred_z_0 + dir_zt + noise
-            
-            
-            ##############################################
-            image_pred = self.model.differentiable_decode_first_stage(pred_z_0)
-            meas_pred = operator.forward(image_pred,mask=ip_mask)
-            meas_pred = noiser(meas_pred)
-            
-            # Check if this is a style operator
-            if hasattr(operator, '__class__') and ('style' in operator.__class__.__name__.lower() or 'StyleOperator' in operator.__class__.__name__):
-                # For style extraction: use differentiable style loss
-                # This maintains the computational graph and allows gradient-based optimization
-                
-                # Extract target style features from measurements (these are the target style vectors)
-                target_style_features = measurements
-                
-                # Extract style features from the predicted image using the same method
-                pred_style_features = operator.forward(image_pred)
-                
-                # Compute L2 loss between predicted and target style features
-                style_loss = torch.linalg.norm(pred_style_features - target_style_features)
-                
-                # For style extraction: use only the style loss (no inpaint error)
-                error = style_loss * omega
-                
-                print(f'Style loss: {style_loss.item():.4f}')
-                
-                # Continue with gradient computation for style operators
-                # (no early return - let it proceed to gradient computation)
-                
-            else:
-                # For other operators: use L2 norm and projection
-                meas_error = torch.linalg.norm(meas_pred - measurements)
-                
-                ortho_project = image_pred - operator.transpose(operator.forward(image_pred, mask=ip_mask))
-                parallel_project = operator.transpose(measurements)
-                inpainted_image = parallel_project + ortho_project
-                
-                # pdb.set_trace()
-                # encoded_z_0 = self.model.encode_first_stage(inpainted_image) if ffhq256 else self.model.encode_first_stage(inpainted_image) 
-                encoded_z_0 = self.model.encode_first_stage(inpainted_image.type(torch.float32))
-                encoded_z_0 = self.model.get_first_stage_encoding(encoded_z_0)
-                inpaint_error = torch.linalg.norm(encoded_z_0 - pred_z_0)
-                
-                error = inpaint_error * gamma + meas_error * omega
-            gradients = torch.autograd.grad(error, inputs=z_t)[0]
-            # Add learning rate for stable gradient descent
-            lr = 0.01  # Adjust this value to control gradient step size
-            z_prev = z_prev - lr * gradients
-            print('Loss: ', error.item())
-            
-            return z_prev.detach(), pred_z_0.detach()
-        
-        elif general_inverse:
-            # print('Running general inverse module...')
-            z_t = torch.clone(x.detach())
-            z_t.requires_grad = True
-            
-            if unconditional_conditioning is None or unconditional_guidance_scale == 1.:
-                e_t = self.model.apply_model(z_t, t, c)
-            else:
-                x_in = torch.cat([z_t] * 2)
-                t_in = torch.cat([t] * 2)
-                c_in = torch.cat([unconditional_conditioning, c])
-                e_t_uncond, e_t = self.model.apply_model(x_in, t_in, c_in).chunk(2)
-                e_t = e_t_uncond + unconditional_guidance_scale * (e_t - e_t_uncond)
-            
-            
-            if score_corrector is not None:
-                assert self.model.parameterization == "eps"
-                e_t = score_corrector.modify_score(self.model, e_t, z_t, t, c, **corrector_kwargs)
-            
-            
-            alphas = self.model.alphas_cumprod if use_original_steps else self.ddim_alphas
-            alphas_prev = self.model.alphas_cumprod_prev if use_original_steps else self.ddim_alphas_prev
-            sqrt_one_minus_alphas = self.model.sqrt_one_minus_alphas_cumprod if use_original_steps else self.ddim_sqrt_one_minus_alphas
-            sigmas = self.model.ddim_sigmas_for_original_num_steps if use_original_steps else self.ddim_sigmas
-            # select parameters corresponding to the currently considered timestep
-            a_t = torch.full((b, 1, 1, 1), alphas[index], device=device)
-            a_prev = torch.full((b, 1, 1, 1), alphas_prev[index], device=device)
-            sigma_t = torch.full((b, 1, 1, 1), sigmas[index], device=device)
-            sqrt_one_minus_at = torch.full((b, 1, 1, 1), sqrt_one_minus_alphas[index],device=device)
-            
-            # current prediction for x_0
-            pred_z_0 = (z_t - sqrt_one_minus_at * e_t) / a_t.sqrt()
-            
-            
-            if quantize_denoised:
-                pred_z_0, _, *_ = self.model.first_stage_model.quantize(pred_z_0)
-            
-            
-            # direction pointing to x_t
-            dir_zt = (1. - a_prev - sigma_t**2).sqrt() * e_t
-            noise = sigma_t * noise_like(x.shape, device, repeat_noise) * temperature
-            if noise_dropout > 0.:
-                noise = torch.nn.functional.dropout(noise, p=noise_dropout)
-            
-            z_prev = a_prev.sqrt() * pred_z_0 + dir_zt + noise
-            
-            
-            ##############################################
-            image_pred = self.model.differentiable_decode_first_stage(pred_z_0)
-            meas_pred = operator.forward(image_pred)
-            meas_pred = noiser(meas_pred)
-            ##here
-            # # Check if this is a style operator
-            # if hasattr(operator, '__class__') and ('style' in operator.__class__.__name__.lower() or 'StyleOperator' in operator.__class__.__name__):
-            #     # For style extraction: use differentiable style loss
-            #     # This maintains the computational graph and allows gradient-based optimization
-                
-            #     # Extract target style features from measurements (these are the target style vectors)
-            #     target_style_features = measurements
-                
-            #     # Extract style features from the predicted image using the same method
-            #     pred_style_features = operator.forward(image_pred)
-                
-            #     # Compute L2 loss between predicted and target style features
-            #     style_loss = torch.linalg.norm(pred_style_features - target_style_features)
-                
-            #     # For style extraction: use only the style loss (no inpaint error)
-            #     error = style_loss * omega
-                
-            #     print(f'Style loss: {style_loss.item():.4f}')
-                
-            #     # Continue with gradient computation for style operators
-            #     # (no early return - let it proceed to gradient computation)
-                
-            #else:
-            # For other operators: use L2 norm and projection
-            meas_error = torch.linalg.norm(meas_pred - measurements)
-            
-            ortho_project = image_pred - operator.transpose(operator.forward(image_pred))
-            parallel_project = operator.transpose(measurements)
-            inpainted_image = parallel_project + ortho_project
-            
-            # encoded_z_0 = self.model.encode_first_stage(inpainted_image) if ffhq256 else self.model.encode_first_stage(inpainted_image).mean  
-            encoded_z_0 = self.model.encode_first_stage(inpainted_image)
-            encoded_z_0 = self.model.get_first_stage_encoding(encoded_z_0)
-            inpaint_error = torch.linalg.norm(encoded_z_0 - pred_z_0)
-            
-            error = inpaint_error * gamma + meas_error * omega
-                # else ends
-            
-            gradients = torch.autograd.grad(error, inputs=z_t)[0]
-            # Add learning rate for stable gradient descent
-            lr = 0.01  # Adjust this value to control gradient step size
-            z_prev = z_prev - lr * gradients
-            print('Loss: ', error.item())
-            
-            return z_prev.detach(), pred_z_0.detach()
-        
-        
-        #########################################
-        else:
-            if unconditional_conditioning is None or unconditional_guidance_scale == 1.:
-                with torch.no_grad():
-                    e_t = self.model.apply_model(x, t, c)
-            else:
-                x_in = torch.cat([x] * 2)
-                t_in = torch.cat([t] * 2)
-                c_in = torch.cat([unconditional_conditioning, c])
-                ## lr
-                with torch.no_grad():
-                    e_t_uncond, e_t = self.model.apply_model(x_in, t_in, c_in).chunk(2)
-                e_t = e_t_uncond + unconditional_guidance_scale * (e_t - e_t_uncond)
-
-            if score_corrector is not None:
-                assert self.model.parameterization == "eps"
-                ## lr
-                with torch.no_grad():
-                    e_t = score_corrector.modify_score(self.model, e_t, x, t, c, **corrector_kwargs)
-
-            alphas = self.model.alphas_cumprod if use_original_steps else self.ddim_alphas
-            alphas_prev = self.model.alphas_cumprod_prev if use_original_steps else self.ddim_alphas_prev
-            sqrt_one_minus_alphas = self.model.sqrt_one_minus_alphas_cumprod if use_original_steps else self.ddim_sqrt_one_minus_alphas
-            sigmas = self.model.ddim_sigmas_for_original_num_steps if use_original_steps else self.ddim_sigmas
-            # select parameters corresponding to the currently considered timestep
-            a_t = torch.full((b, 1, 1, 1), alphas[index], device=device)
-            a_prev = torch.full((b, 1, 1, 1), alphas_prev[index], device=device)
-            sigma_t = torch.full((b, 1, 1, 1), sigmas[index], device=device)
-            sqrt_one_minus_at = torch.full((b, 1, 1, 1), sqrt_one_minus_alphas[index],device=device)
-
-            # current prediction for x_0
-            pred_x0 = (x - sqrt_one_minus_at * e_t) / a_t.sqrt()
-            if quantize_denoised:
-                ## 
-                with torch.no_grad():
-                    pred_x0, _, *_ = self.model.first_stage_model.quantize(pred_x0)
-            # direction pointing to x_t
-            dir_xt = (1. - a_prev - sigma_t**2).sqrt() * e_t
-            noise = sigma_t * noise_like(x.shape, device, repeat_noise) * temperature
-            if noise_dropout > 0.:
-                noise = torch.nn.functional.dropout(noise, p=noise_dropout)
-            x_prev = a_prev.sqrt() * pred_x0 + dir_xt + noise
-
-            return x_prev, pred_x0
     
     ######################
     
