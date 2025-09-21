@@ -26,12 +26,34 @@ python scripts/inverse.py \
     --task_config='configs/style_extraction_config.yaml' \
     --outdir='outputs/psld-samples-fr'\
     --prompt='happy dog'\
+    --omega=10\
     --ddim_steps=100;
 
 
 python scripts/inverse.py \
     --file_id='im1.jpg' \
     --task_config='configs/style_extraction_config.yaml' \
-    --outdir='outputs/psld-samples-fr'\
-    --prompt='happy dog'\
-    --ddim_steps=1000;
+    --outdir='outputs/psld-samples-clip_exp3'\
+    --prompt='A tropic island with a volcano'\
+    --ddim_eta=0\
+    --omega=10\
+    --scale=3\
+    --ddim_steps=100;
+
+
+
+
+python scripts/inverse.py \
+    --file_id='rgb_toystory2.jpg' \
+    --task_config='configs/style_extraction_config.yaml' \
+    --outdir='outputs/psld-samples-clip_exp3'\
+    --prompt='A dog'\
+    --ddim_eta=0\
+    --omega=10\
+    --scale=3\
+    --ddim_steps=20;
+
+
+
+
+#'A tropic island with a volcano'

@@ -527,19 +527,19 @@ class CLIPStyleOperator(NonLinearOperator):
         return F.normalize(part, dim=1)
 
     def forward(self, data, **kwargs):
-        # Handle both tensor and PIL inputs
         if torch.is_tensor(data):
-            # Convert from [-1, 1] to [0, 1] range
+            # Handle tensors: convert from [-1, 1] to [0, 1] range
             data = data.add(1.0).div(2.0).clamp(0.0, 1.0)
             
-        if data.dim() == 3:
-            data = data.unsqueeze(0) 
+            # Ensure we have batch dimension
+            if data.dim() == 3:
+                data = data.unsqueeze(0)
                 
-            # Extract style features
+            # Extract style features directly from tensor
             style_vec = self.style_vec(data, **kwargs)
             return style_vec
         else:
-
+            # Handle PIL images: apply transform pipeline
             transform = T.Compose([
                 T.Resize((224, 224)),
                 T.ToTensor(),

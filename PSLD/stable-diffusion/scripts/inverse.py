@@ -464,6 +464,10 @@ def main():
         y = operator.forward(org_image, mask=mask)
         y_n = noiser(y)
 
+    elif (measure_config['operator']['name'] == 'clip_style_retrieval') or (measure_config['operator']['name'] == 'style_retrieval'):  #TODO: check if these 4 lines are necessary 
+        y = operator.forward(org_image) # Forward measurement model (Ax) without noise
+        y_n = y
+        mask = None
     else: 
         # Forward measurement model (Ax + n)
         y = operator.forward(org_image)
@@ -516,7 +520,7 @@ def main():
                                                         batch_size=opt.n_samples,
                                                         shape=shape,
                                                         verbose=False,
-                                                        unconditional_guidance_scale=opt.scale,
+                                                        unconditional_guidance_scale= opt.scale,
                                                         unconditional_conditioning=uc,
                                                         eta=opt.ddim_eta,
                                                         x_T=start_code,

@@ -279,15 +279,20 @@ class DDIMSampler(object):
             
             ##############################################
             image_pred = self.model.differentiable_decode_first_stage(pred_z_0)
-            meas_pred = operator.forward(image_pred)
-            if operator.name == 'clip_style_retrieval' or operator.name == 'style_retrieval':
-                pass
-            else:
+            
+            # Check if this is a style operator first
+            is_style_operator = (hasattr(operator, '__class__') and 
+                                ('style' in operator.__class__.__name__.lower() or 
+                                 'StyleOperator' in operator.__class__.__name__))
+            
+            if not is_style_operator:
+                # For non-style operators: get measurement prediction and add noise
+                meas_pred = operator.forward(image_pred)
                 meas_pred = noiser(meas_pred)
 
 
-            # Check if this is a style operator
-            if hasattr(operator, '__class__') and ('style' in operator.__class__.__name__.lower() or 'StyleOperator' in operator.__class__.__name__):
+            # Handle style operators
+            if is_style_operator:
                 # For style extraction: use differentiable style loss
                 # This maintains the computational graph and allows gradient-based optimization
                 
@@ -312,13 +317,13 @@ class DDIMSampler(object):
                 # Combine both losses for better style transfer
                 style_loss = cosine_loss #+ l2_reg
                 
-                print(f'***Cosine similarity: {cosine_sim.mean().item():.3f}, Cosine loss: {cosine_loss.item():.3f}, L2 reg: {l2_reg.item():.3f}')
+                print(f'***Cosine similarity: {cosine_sim.mean().item():.3f}, Cosine loss: {style_loss.item():.3f}, L2 reg: {l2_reg.item():.3f}')
 
-                # For style extraction: use only the style loss (no inpaint error)
-                omega_t = omega * (1.0 - a_t).clamp(0,1).pow(2)
-                error = style_loss * omega_t
+                # 3) Time schedule on omega (late-strong)
+                omega_t = omega * a_t.pow(2)                                 # a_t = alphas[index]
+                error   = omega * style_loss
                 
-                print(f'Style loss: {style_loss.item():.4f}')
+                print(f'Style loss: {style_loss.item():.4f}, Omega_t: {omega_t.item():.4f}')
                 
                 # Continue with gradient computation for style operators
                 # (no early return - let it proceed to gradient computation)
@@ -338,47 +343,45 @@ class DDIMSampler(object):
                 
                 error = inpaint_error * gamma + meas_error * omega
             
-            gradients = torch.autograd.grad(error, inputs=z_t)[0]
+            gradients = torch.autograd.grad(error, inputs=z_t,  retain_graph=False)[0]
             
             # Adaptive learning rate based on gradient-to-parameter ratio
             grad_norm = gradients.norm()
             normalized_gradients = gradients / (grad_norm + 1e-8)
+
+            # trust-region: move ~k of ||z|| per step, scaled by the same late-strong sched
+            k = 0.02                                                     # 2% of ||z||
+            step_size_t = (k * a_t.pow(2) * z_prev.norm()).clamp(1e-4, 2e-1)
             z_norm = z_prev.norm()
-            print(f'grad_NORM: {normalized_gradients.norm().item()}')
+            print(f'grad_NORM: {normalized_gradients.norm().item():.3f}')
             
-            # Calculate optimal learning rate: want gradient step to be ~1% of parameter norm (conservative)
-            target_step_size = z_norm * 0.005  # 1% of parameter norm (conservative)
-            print(f'Target_step_size: {target_step_size.item():.3f}')
-
-            target_frac = 5e-4                                     # tune 1e-4..1e-3
-            step = (target_frac * z_norm).clamp(1e-5, 1e-2)
-            step = step * (sigma_t / sigmas.max()).pow(2)
 
 
+            # Debug learning rate calculation
 
-            lr = (target_step_size * z_norm).clamp(1e-5, 1e-2)  # Adaptive based on gradient magnitude
-            print(f'LR: {lr.item():.3f}')
-            # Clamp learning rate to reasonable bounds (keep it small)
-            #lr = torch.clamp(lr, min=0.0001, max=0.5)  # Conservative bounds
-            
             # Apply gradient update
-            z_prev = z_prev -  step * normalized_gradients
+            lr = (omega_t).clamp(0.3, 3).item()
+            z_prev = z_prev - lr * normalized_gradients
+
+            
             
             # Calculate actual step size for monitoring
-            actual_step_size = step.item()
             
             print(f'Gradients: {gradients.norm().item():.6f}, Z_PREV: {z_prev.norm().item():.6f}')
-            print(f'Learning Rate: {lr.item():.3f}, Step Size: {actual_step_size:.3f}')
+            print(f'Learning Rate: {lr:.3f}, Step Size: {step_size_t.item():.3f}')
             print(f'Loss: {error.item():.6f}')
             
             # Log metrics (handle both style and non-style operators)
             if self.tensorboard_logger is not None:
                 metrics_to_log = {
                     'loss/total_loss': error.item(),
-                    'optimization/learning_rate': lr.item(),
-                    'optimization/step_size': actual_step_size,
+                    'optimization/learning_rate': lr,
+                    'optimization/step_size': step_size_t.item(),
                     'optimization/gradient_norm': grad_norm.item(),
-                    'optimization/parameter_norm': z_norm.item()
+                    'optimization/parameter_norm': z_norm.item(),
+                    'optimization/omega': omega,
+                    'optimization/omega_t': omega_t,
+
                 }
                 
                 # Add style loss if it exists (for style operators)
