@@ -239,6 +239,53 @@ class PSLDTensorBoardLogger:
             'latent/min': z_min
         }, step)
     
+    def log_scale_parameters(self, gamma_scale=None, unconditional_guidance_scale=None, 
+                           diffusion_timestep=None, total_steps=None, current_step=None, step=None):
+        """
+        Log scale-related parameters for PSLD diffusion process.
+        
+        Args:
+            gamma_scale: Gamma scaling factor (usually index/total_steps)
+            unconditional_guidance_scale: Unconditional guidance scale 
+            diffusion_timestep: Current diffusion timestep
+            total_steps: Total number of diffusion steps
+            current_step: Current step in the diffusion process
+            step: Step number for logging
+        """
+        if step is None:
+            step = self.step
+        
+        scale_metrics = {}
+        
+        if gamma_scale is not None:
+            if isinstance(gamma_scale, torch.Tensor):
+                gamma_scale = gamma_scale.item()
+            scale_metrics['scales/gamma_scale'] = gamma_scale
+        
+        if unconditional_guidance_scale is not None:
+            if isinstance(unconditional_guidance_scale, torch.Tensor):
+                unconditional_guidance_scale = unconditional_guidance_scale.item()
+            scale_metrics['scales/unconditional_guidance_scale'] = unconditional_guidance_scale
+        
+        if diffusion_timestep is not None:
+            if isinstance(diffusion_timestep, torch.Tensor):
+                diffusion_timestep = diffusion_timestep.item()
+            scale_metrics['scales/diffusion_timestep'] = diffusion_timestep
+        
+        if total_steps is not None:
+            scale_metrics['scales/total_steps'] = total_steps
+        
+        if current_step is not None:
+            scale_metrics['scales/current_step'] = current_step
+            
+        # Calculate progress ratio if both current_step and total_steps are available
+        if current_step is not None and total_steps is not None and total_steps > 0:
+            progress_ratio = current_step / total_steps
+            scale_metrics['scales/progress_ratio'] = progress_ratio
+        
+        if scale_metrics:
+            self.log_metrics(scale_metrics, step)
+    
     def close(self):
         """Close the TensorBoard writer."""
         self.writer.close()

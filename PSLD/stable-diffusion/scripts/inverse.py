@@ -455,7 +455,7 @@ def main():
     org_image = org_image[None,:,:,:].to(device)
 
     # Exception) In case of inpainging,
-    if measure_config['operator'] ['name'] == 'inpainting':
+    if measure_config['operator']['name'] == 'inpainting':
         mask = mask_gen(org_image) # dps mask
         # mask = torch.ones_like(org_image) # no mask
         
