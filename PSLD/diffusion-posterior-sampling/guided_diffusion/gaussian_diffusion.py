@@ -173,9 +173,13 @@ class GaussianDiffusion:
                       measurement,
                       measurement_cond_fn,
                       record,
-                      save_root):
+                      save_root,
+                      style_guidance=None):
         """
         The function used for sampling from noise.
+        
+        Args:
+            style_guidance: Optional UGD style guidance instance
         """ 
         img = x_start
         device = x_start.device
@@ -196,6 +200,15 @@ class GaussianDiffusion:
                                       noisy_measurement=noisy_measurement,
                                       x_prev=img,
                                       x_0_hat=out['pred_xstart'])
+            
+            # UGD Style Guidance: Apply guidance on predicted x_0
+            if style_guidance is not None:
+                img = style_guidance.apply_guidance_to_latent(
+                    latent=img, 
+                    pred_x0=out['pred_xstart'], 
+                    timestep=idx
+                )
+            
             img = img.detach_()
            
             pbar.set_postfix({'distance': distance.item()}, refresh=False)

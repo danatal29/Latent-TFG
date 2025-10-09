@@ -18,3 +18,4 @@ class GuidanceConfig:
     num_steps: int = 5
     step_wt: float = 5.0         # like UGD's --optim_forward_guidance_wt
     decode_kwargs: Optional[Dict] = None  # e.g., clamp, range, VAE fp
+

@@ -268,3 +268,4 @@ def validate_guidance_compatibility(guidance_cfg: GuidanceConfig, psld_domain: s
         return True  # Still works, just less efficient
     
     return True
+

@@ -29,6 +29,13 @@ def main():
     parser.add_argument('--task_config', type=str)
     parser.add_argument('--gpu', type=int, default=0)
     parser.add_argument('--save_dir', type=str, default='./results')
+    
+    # UGD Style Guidance flags (minimal POC)
+    parser.add_argument('--enable_ugd_style', action='store_true', help='Enable UGD style guidance')
+    parser.add_argument('--ugd_weight', type=float, default=1.0, help='UGD guidance weight')
+    parser.add_argument('--ugd_schedule', type=str, default='', help='Timesteps for UGD (e.g., "100,200,300")')
+    parser.add_argument('--style_image', type=str, default='', help='Path to style target image')
+    
     args = parser.parse_args()
    
     # logger
@@ -66,7 +73,42 @@ def main():
    
     # Load diffusion sampler
     sampler = create_sampler(**diffusion_config) 
-    sample_fn = partial(sampler.p_sample_loop, model=model, measurement_cond_fn=measurement_cond_fn)
+    
+    # UGD Style Guidance setup (minimal POC)
+    style_guidance = None
+    if args.enable_ugd_style and args.style_image:
+        try:
+            from guidance.style_ugd import create_style_guidance
+            import torchvision.transforms as transforms
+            from PIL import Image
+            
+            # Parse UGD schedule
+            ugd_schedule = None
+            if args.ugd_schedule:
+                ugd_schedule = [int(x.strip()) for x in args.ugd_schedule.split(',')]
+            
+            # Create UGD guidance
+            style_guidance = create_style_guidance(
+                guidance_weight=args.ugd_weight,
+                guidance_schedule=ugd_schedule
+            )
+            
+            # Load style image
+            style_img = Image.open(args.style_image).convert('RGB')
+            transform = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))  # [-1, 1]
+            ])
+            style_tensor = transform(style_img).to(device)
+            style_guidance.set_style_target(style_tensor)
+            
+            logger.info(f"UGD style guidance enabled: weight={args.ugd_weight}, schedule={ugd_schedule}")
+            
+        except Exception as e:
+            logger.error(f"Failed to setup UGD guidance: {e}")
+            style_guidance = None
+    
+    sample_fn = partial(sampler.p_sample_loop, model=model, measurement_cond_fn=measurement_cond_fn, style_guidance=style_guidance)
    
     # Working directory
     out_path = os.path.join(args.save_dir, measure_config['operator']['name'])
