@@ -30,6 +30,18 @@ class UGDDDIMSampler(DDIMSampler):
     
     def __init__(self, model, schedule="linear", **kwargs):
         super().__init__(model, schedule, **kwargs)
+        
+        # Initialize TensorBoard logger
+        try:
+            from tensorboard_logger import get_tensorboard_logger
+            self.tensorboard_logger = get_tensorboard_logger(
+                experiment_name="ugd_style_guidance"
+            )
+            self.log_step = 0
+        except ImportError:
+            print("Warning: tensorboard_logger not available, logging disabled")
+            self.tensorboard_logger = None
+            self.log_step = 0
 
     def p_sample_ddim(self, x, c, t, index, repeat_noise=False, use_original_steps=False, quantize_denoised=False,
                       temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
@@ -151,22 +163,50 @@ class UGDDDIMSampler(DDIMSampler):
                 with torch.no_grad():
                     # optional stabilization
                     # grad = grad / (grad.norm().clamp_min(1e-6))
+                    x_t_prev = x_t.clone()  # Store previous for step size calculation
                     x_t.add_(- guidance_cfg.step_wt * grad)
+                    
+                    # Calculate actual step size taken
+                    step_size_taken = (x_t - x_t_prev).norm()
 
                 # re-leaf for next inner iteration (except after the last)
                 if step_idx < guidance_cfg.num_steps - 1:
                     x_t = x_t.detach().requires_grad_(True)
 
-                # optional logging (safe)
-                if step_idx % 1 == 0:
-                    gnorm = float(grad.norm().detach().cpu())
-                    lval  = float(loss.detach().cpu())
-                    print(f"✅ UGD step {step_idx}: loss={lval:.6f}, grad_norm={gnorm:.6f}")
+                # Logging for each inner step
+                gnorm = float(grad.norm().detach().cpu())
+                lval  = float(loss.detach().cpu())
+                x_t_norm = float(x_t.norm().detach().cpu())
+                
+                print(f"✅ UGD step {step_idx}: loss={lval:.6f}, grad_norm={gnorm:.6f}")
+                
+                # TensorBoard logging - metrics only during inner loop
+                if self.tensorboard_logger is not None:
+                    # Log metrics for this inner optimization step
+                    metrics_to_log = {
+                        'ugd_inner/loss': lval,
+                        'ugd_inner/gradient_norm': gnorm,
+                        'ugd_inner/parameter_norm': x_t_norm,
+                        'ugd_inner/step_size': step_size_taken.item(),
+                        'ugd_inner/learning_rate': guidance_cfg.step_wt,
+                    }
+                    
+                    self.tensorboard_logger.log_metrics(metrics_to_log, step=self.log_step)
+                    
+                    # Log gradient statistics
+                    self.tensorboard_logger.log_gradients(grad, step=self.log_step)
+                    
+                    # Log latent statistics
+                    self.tensorboard_logger.log_latent_stats(x_t, step=self.log_step)
+                    
+                    # NOTE: Not logging images during inner loop - they're intermediate states and look bad
+                    # Images will be logged after inner loop completes with the final optimized result
+                    
+                    self.log_step += 1
 
             # use improved state for the outer DDIM update
             x = x_t.detach()
-
-
+            
             # Re-evaluate e_t, pred_x0 with the final optimized x
             if unconditional_conditioning is None or unconditional_guidance_scale == 1.:
                 e_t = self.model.apply_model(x, t, c)
@@ -177,8 +217,29 @@ class UGDDDIMSampler(DDIMSampler):
                 e_t_uncond, e_t = self.model.apply_model(x_in, t_in, c_in).chunk(2)
                 e_t = e_t_uncond + unconditional_guidance_scale * (e_t - e_t_uncond)
             
-            # Recompute pred_x0 with optimized x
+            # Recompute pred_x0 with optimized x - this is our prediction of clean x_0 from optimized x_t
             pred_x0 = (x - sqrt_one_minus_at * e_t) / a_t.sqrt()
+            
+            # Log summary and the pred_x0 (our guess at x_0 from the optimized x_t)
+            if self.tensorboard_logger is not None:
+                with torch.no_grad():
+                    final_loss = float(loss.detach().cpu())
+                    metrics_summary = {
+                        'ugd_outer/final_inner_loss': final_loss,
+                        'ugd_outer/num_inner_steps': guidance_cfg.num_steps,
+                    }
+                    self.tensorboard_logger.log_metrics(metrics_summary, step=self.log_step)
+                    
+                    # Decode pred_x0 to image space - this is our guess at what x_0 looks like
+                    # pred_x0 is in latent space, decode it to RGB image for visualization
+                    pred_x0_image = self.model.decode_first_stage(pred_x0)
+                    
+                    # Log every outer step to see progression
+                    self.tensorboard_logger.log_image(pred_x0_image, 
+                                                    name=f"ugd_pred_x0_optimized", 
+                                                    step=self.log_step, 
+                                                    every_n_steps=1)
+                    print(f"📸 Logged pred_x0 (optimized) at outer step {index}, timestep {int(t[0])}, log_step {self.log_step}")
 
         # 6) Continue with standard DDIM direction/noise synthesis
         if quantize_denoised:
@@ -192,6 +253,21 @@ class UGDDDIMSampler(DDIMSampler):
             noise = torch.nn.functional.dropout(noise, p=noise_dropout)
             
         x_prev = a_prev.sqrt() * pred_x0 + dir_xt + noise
+        
+        # Log scale parameters only (image already logged after inner loop)
+        if self.tensorboard_logger is not None:
+            with torch.no_grad():
+                # Log scale parameters (similar to PSLD)
+                self.tensorboard_logger.log_scale_parameters(
+                    unconditional_guidance_scale=unconditional_guidance_scale,
+                    diffusion_timestep=int(t[0]) if hasattr(t, '__getitem__') else int(t),
+                    step=self.log_step
+                )
+                
+                # Don't log image here - already logged after inner loop optimization
+                # This avoids duplicate/redundant images
+                
+                self.log_step += 1
         
         return x_prev, pred_x0
 
@@ -326,6 +402,17 @@ class UGDDDIMSampler(DDIMSampler):
                 img_orig = self.model.q_sample(x0, ts)  # TODO: deterministic forward pass?
                 img = img_orig * mask + (1. - mask) * img
 
+            # Log outer diffusion step info
+            if self.tensorboard_logger is not None:
+                with torch.no_grad():
+                    # Log diffusion progress
+                    self.tensorboard_logger.log_scale_parameters(
+                        diffusion_timestep=int(step),
+                        total_steps=int(total_steps),
+                        current_step=int(index),
+                        step=self.log_step
+                    )
+
             # Call UGD-enhanced p_sample_ddim
             outs = self.p_sample_ddim(img, cond, ts, index=index, 
                                       use_original_steps=ddim_use_original_steps,
@@ -346,5 +433,15 @@ class UGDDDIMSampler(DDIMSampler):
             if index % log_every_t == 0 or index == total_steps - 1:
                 intermediates['x_inter'].append(img)
                 intermediates['pred_x0'].append(pred_x0)
+                
+                # Log intermediate pred_x0 at key checkpoints
+                if self.tensorboard_logger is not None:
+                    with torch.no_grad():
+                        decoded_pred_x0 = self.model.decode_first_stage(pred_x0)
+                        self.tensorboard_logger.log_image(decoded_pred_x0, 
+                                                        name=f"diffusion_pred_x0", 
+                                                        step=self.log_step, 
+                                                        every_n_steps=1)
+                        print(f"📸 Logged pred_x0 at diffusion step {index}/{total_steps}")
 
         return img, intermediates

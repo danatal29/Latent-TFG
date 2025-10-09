@@ -204,7 +204,7 @@ class DDIMSampler(object):
                                       inpainting=inpainting, omega=omega,
                                       gamma_scale = index/total_steps,
                                       general_inverse=general_inverse, noiser=noiser,
-                                      ffhq256=ffhq256, total_steps=total_steps)
+                                      ffhq256=ffhq256)
             img, pred_x0 = outs
             if callback: callback(i)
             if img_callback: img_callback(pred_x0, i)
@@ -232,8 +232,8 @@ class DDIMSampler(object):
         
         if general_inverse:
             # print('Running general inverse module...')
-            z_t = x.clone().detach().requires_grad_(True)
-            print(f"Debug PSLD - z_t setup: requires_grad={z_t.requires_grad}, is_leaf={z_t.is_leaf}")
+            z_t = torch.clone(x.detach())
+            z_t.requires_grad = True
             
             if unconditional_conditioning is None or unconditional_guidance_scale == 1.:
                 e_t = self.model.apply_model(z_t, t, c)
@@ -263,16 +263,6 @@ class DDIMSampler(object):
             # current prediction for x_0
             pred_z_0 = (z_t - sqrt_one_minus_at * e_t) / a_t.sqrt()
             
-            # DEBUG: Check gradient flow through prediction computation
-            print(f"Debug PSLD - z_t.requires_grad: {z_t.requires_grad}")
-            print(f"Debug PSLD - e_t.requires_grad: {e_t.requires_grad}")
-            print(f"Debug PSLD - pred_z_0.requires_grad after computation: {pred_z_0.requires_grad}")
-            
-            # CRITICAL: Ensure pred_z_0 maintains gradients from z_t
-            if z_t.requires_grad and not pred_z_0.requires_grad:
-                print("🔧 PSLD: pred_z_0 lost gradients! Attempting to restore...")
-                pred_z_0 = pred_z_0.requires_grad_(True)
-            
             
             if quantize_denoised:
                 pred_z_0, _, *_ = self.model.first_stage_model.quantize(pred_z_0)
@@ -289,14 +279,6 @@ class DDIMSampler(object):
             
             ##############################################
             image_pred = self.model.differentiable_decode_first_stage(pred_z_0)
-            
-            # CRITICAL: Ensure image_pred has gradients for style loss computation
-            if pred_z_0.requires_grad and not image_pred.requires_grad:
-                print("🔧 PSLD: Enabling gradients on decoded image")
-                image_pred = image_pred.requires_grad_(True)
-            
-            print(f"Debug PSLD - pred_z_0.requires_grad: {pred_z_0.requires_grad}")
-            print(f"Debug PSLD - image_pred.requires_grad after decode: {image_pred.requires_grad}")
             
             # Check if this is a style operator first
             is_style_operator = (hasattr(operator, '__class__') and 
@@ -315,17 +297,10 @@ class DDIMSampler(object):
                 # This maintains the computational graph and allows gradient-based optimization
                 
                 # Extract target style features from measurements (these are the target style vectors)
-                # Target should NOT have gradients - it's fixed reference we're matching TO
                 target_style_features = measurements.detach()
                 
                 # Extract style features from the predicted image using the same method
                 pred_style_features = operator.forward(image_pred)
-                
-                # Debug gradient flow throughout the pipeline
-                print(f"Debug PSLD - image_pred.requires_grad: {image_pred.requires_grad}")
-                print(f"Debug PSLD - target_style_features.requires_grad: {target_style_features.requires_grad}")
-                print(f"Debug PSLD - pred_style_features.requires_grad: {pred_style_features.requires_grad}")
-                print(f"Debug PSLD - pred_style_features.shape: {pred_style_features.shape}")
                 
                 # Compute cosine similarity loss for style features
                 # Normalize features for cosine similarity - make sure this preserves gradients
