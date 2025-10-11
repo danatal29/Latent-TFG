@@ -2,6 +2,7 @@ import argparse, os, sys, glob
 import cv2
 import torch
 import numpy as np
+import torch.nn.functional as F
 from omegaconf import OmegaConf
 from PIL import Image
 from tqdm import tqdm, trange
@@ -17,6 +18,7 @@ from contextlib import contextmanager, nullcontext
 from ldm.util import instantiate_from_config
 from ldm.models.diffusion.psld import DDIMSampler
 from ldm.models.diffusion.ddim_ugd import UGDDDIMSampler  # UGD-enhanced sampler
+from ldm.models.diffusion.psld_ugd import PSLDUGDSampler  # Unified PSLD+UGD sampler
 from ldm.models.diffusion.plms import PLMSSampler
 from ldm.models.diffusion.dpm_solver import DPMSolverSampler
 from ldm.guidance.api import GuidanceConfig, GuidanceFn
@@ -116,12 +118,24 @@ def check_safety(x_image):
     return x_checked_image, has_nsfw_concept
 
 
-def create_style_guidance_function(style_image_path, device):
+def create_style_guidance_function(style_image_path, device, operator):
     """
-    Create UGD style guidance function using PSLD's existing style operators.
+    Create UGD style guidance function using PSLD's existing operator.
+    
+    Args:
+        style_image_path: Path to style reference image
+        device: torch device
+        operator: PSLD operator from config (reused for consistency)
+    
+    Returns:
+        style_guidance_fn: Function that computes style loss for UGD
     """
     if not style_image_path:
         print(f"⚠️  No style image path provided")
+        return None
+    
+    if operator is None:
+        print(f"⚠️  No operator provided - cannot create guidance")
         return None
         
     # Try to resolve the path relative to current working directory
@@ -150,60 +164,85 @@ def create_style_guidance_function(style_image_path, device):
             print(f"✅ Found style image at: {style_image_path}")
     
     try:
-        # Add DPS path for style operators
-        sys.path.append('../diffusion-posterior-sampling/')
-        from guided_diffusion.measurements import StyleOperator
-        
         print(f"🎨 Loading style guidance from: {style_image_path}")
+        print(f"🎨 Using PSLD operator: {operator.__class__.__name__}")
         
-        # Create style operator
-        style_op = StyleOperator(device=device)
-        
-        # Load and preprocess target style image  
-        import torchvision.transforms as T
+        # Load and preprocess target style image using torch operations for consistency
         style_img = Image.open(style_image_path).convert('RGB')
-        transform = T.Compose([
-            T.Resize((224, 224)),
-            T.ToTensor(),
-            T.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
-        ])
-        target_tensor = transform(style_img).unsqueeze(0).to(device)
         
-        # Extract target style features
+        # Convert to tensor [-1, 1] range to match PSLD expectations
+        import torchvision.transforms.functional as TF
+        style_tensor = TF.to_tensor(style_img).to(device)
+        style_tensor = style_tensor * 2.0 - 1.0  # [0,1] -> [-1,1]
+        style_tensor = style_tensor.unsqueeze(0)  # Add batch dim
+        
+        # Resize to proper dimensions if needed
+        if style_tensor.shape[-1] != 512 or style_tensor.shape[-2] != 512:
+            style_tensor = torch.nn.functional.interpolate(
+                style_tensor, size=(512, 512), mode='bilinear', align_corners=False
+            )
+        
+        # Extract target style features using PSLD's operator
         with torch.no_grad():
-            target_features = style_op.forward(target_tensor)
+            target_features = operator.forward(style_tensor)
+            print(f"✅ Extracted target style features: shape={target_features.shape}")
         
         def style_guidance_fn(pred_img, **kwargs):
-            """UGD style guidance function."""
+            """
+            UGD style guidance function using PSLD's operator.
+            
+            Args:
+                pred_img: Predicted image in [-1, 1] range (from decoded latent)
+            
+            Returns:
+                style_loss: Scalar loss for gradient computation
+            """
             try:
-                # Extract style from predicted image
-                pred_features = style_op.forward(pred_img)
+                # Extract style from predicted image using PSLD operator
+                # pred_img should already be in [-1, 1] range from decoder
+                pred_features = operator.forward(pred_img)
                 
-                # Compute style loss (cosine similarity)
-                import torch.nn.functional as F
-                style_loss = 1.0 - F.cosine_similarity(
-                    pred_features, target_features, dim=1
-                ).mean()
+                # Compute style loss using cosine similarity (same as PSLD)
+                
+                
+                # Normalize features for stable cosine similarity
+                pred_norm = F.normalize(pred_features, p=2, dim=-1)
+                target_norm = F.normalize(target_features, p=2, dim=-1)
+                
+                # Cosine similarity loss: minimize 1 - cosine_similarity
+                cosine_sim = F.cosine_similarity(pred_norm, target_norm, dim=-1)
+                style_loss = (1.0 - cosine_sim).mean()
                 
                 return style_loss
                 
             except Exception as e:
-                print(f"Style guidance error: {e}")
-                return torch.tensor(0.0, device=pred_img.device)
+                print(f"⚠️  Style guidance error: {e}")
+                import traceback
+                traceback.print_exc()
+                return torch.tensor(0.0, device=pred_img.device, requires_grad=True)
         
         print(f"✅ Style guidance function created successfully")
-        return style_guidance_fn
+        return style_guidance_fn  # Return only the guidance function
         
-    except ImportError as e:
-        print(f"❌ Failed to import style operators: {e}")
-        return None
     except Exception as e:
         print(f"❌ Failed to create style guidance: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 
-def create_ugd_guidance_config(opt):
-    """Create UGD guidance configuration from CLI arguments."""
+def create_ugd_guidance_config(opt, operator):
+    """
+    Create UGD guidance configuration from CLI arguments.
+    
+    Args:
+        opt: Command line options
+        operator: PSLD operator from config (reused for style extraction)
+    
+    Returns:
+        guidance_cfg: GuidanceConfig object or None
+        guidance_fn: Guidance function or None
+    """
     if not opt.optim_forward_guidance:
         print("📊 UGD guidance disabled - using standard PSLD")
         return None, None
@@ -216,7 +255,7 @@ def create_ugd_guidance_config(opt):
     
     if opt.style_image:
         print(f"🎨 Creating style guidance for: {opt.style_image}")
-        guidance_fn = create_style_guidance_function(opt.style_image, device)
+        guidance_fn = create_style_guidance_function(opt.style_image, device, operator)
     else:
         print("⚠️  UGD guidance enabled but no style_image specified")
         print("📊 Falling back to standard PSLD")
@@ -233,6 +272,8 @@ def create_ugd_guidance_config(opt):
         domain=opt.guidance_domain,
         num_steps=opt.optim_num_steps,
         step_wt=opt.optim_forward_guidance_wt,
+        k_recur=opt.k_recur,
+        normalize_grad=opt.normalize_grad,
         decode_kwargs={'clamp': (-1, 1)} if opt.guidance_domain == "image" else None
     )
         
@@ -240,6 +281,8 @@ def create_ugd_guidance_config(opt):
     print(f"  - Domain: {guidance_cfg.domain}")
     print(f"  - Steps: {guidance_cfg.num_steps}")
     print(f"  - Weight: {guidance_cfg.step_wt}")
+    print(f"  - Self-recurrence: {guidance_cfg.k_recur}")
+    print(f"  - Normalize gradients: {guidance_cfg.normalize_grad}")
     
     return guidance_cfg, guidance_fn
 
@@ -475,6 +518,24 @@ def main():
         help="Domain for guidance computation: 'latent' for z-space, 'image' for decoded images"
     )
     parser.add_argument(
+        "--k_recur",
+        type=int,
+        default=1,
+        help="Number of self-recurrence iterations per timestep (default: 1, no recurrence)"
+    )
+    parser.add_argument(
+        "--normalize_grad",
+        action='store_true',
+        default=True,
+        help="Normalize gradients during optimization for stability (default: True)"
+    )
+    parser.add_argument(
+        "--no_normalize_grad",
+        action='store_false',
+        dest='normalize_grad',
+        help="Disable gradient normalization (may cause instability)"
+    )
+    parser.add_argument(
         "--style_image",
         type=str,
         help="Path to style reference image for style transfer guidance"
@@ -490,6 +551,11 @@ def main():
         type=float,
         default=1.0,
         help="Weight for PSLD measurement consistency loss"
+    )
+    parser.add_argument(
+        "--use_hybrid_sampler",
+        action='store_true',
+        help="Use unified PSLD+UGD sampler that combines both methods for superior style transfer"
     )
     ##
 
@@ -545,23 +611,7 @@ def main():
             
         print(f"✅ Text encoder moved to {device}")
 
-    # Create UGD guidance configuration
-    guidance_cfg, guidance_fn = create_ugd_guidance_config(opt)
-
-    # Create sampler - use UGD-enhanced sampler if guidance is enabled
-    if guidance_cfg and guidance_cfg.enabled:
-        print("🚀 Using UGD-enhanced DDIM sampler")
-        sampler = UGDDDIMSampler(model)
-    else:
-        print("📊 Using standard PSLD DDIM sampler")
-        if opt.plms:
-            sampler = PLMSSampler(model)
-        elif opt.dpm_solver:
-            sampler = DPMSolverSampler(model)
-        else:
-            sampler = DDIMSampler(model)
-
-    # Setup PSLD components
+    # Setup PSLD components FIRST - need operator before creating UGD guidance
     sys.path.append(opt.dps_path)
 
     import yaml
@@ -592,6 +642,31 @@ def main():
     measure_config = task_config['measurement']
     operator = get_operator(device=device, **measure_config['operator'])
     noiser = get_noise(**measure_config['noise'])
+    
+    print(f"✅ Loaded PSLD operator: {operator.__class__.__name__}")
+
+    # Create UGD guidance configuration using PSLD's operator
+    guidance_cfg, guidance_fn = create_ugd_guidance_config(opt, operator)
+
+    # Create sampler based on mode
+    if opt.use_hybrid_sampler:
+        print("🌟 Using UNIFIED PSLD+UGD sampler (hybrid mode)")
+        print("   - Combines UGD inner optimization with PSLD measurement consistency")
+        print("   - Best quality: strong style matching + structural preservation")
+        sampler = PSLDUGDSampler(model)
+    elif guidance_cfg and guidance_cfg.enabled:
+        print("🚀 Using UGD-only DDIM sampler")
+        print("   - Inner optimization loop for style guidance")
+        sampler = UGDDDIMSampler(model)
+    else:
+        print("📊 Using standard PSLD DDIM sampler")
+        print("   - Measurement consistency with adaptive learning rate")
+        if opt.plms:
+            sampler = PLMSSampler(model)
+        elif opt.dpm_solver:
+            sampler = DPMSolverSampler(model)
+        else:
+            sampler = DDIMSampler(model)
 
     # Exception) In case of inpainting, we need to generate a mask 
     if measure_config['operator']['name'] == 'inpainting':
@@ -679,10 +754,11 @@ def main():
                         shape = [opt.C, opt.H // opt.f, opt.W // opt.f]
 
                         # =====================================
-                        # UGD + PSLD INTEGRATION (The Magic!)
+                        # SAMPLING: PSLD / UGD / HYBRID
                         # =====================================
-                        if guidance_cfg and guidance_cfg.enabled:
-                            print("🎯 Running UGD-enhanced sampling...")
+                        if opt.use_hybrid_sampler:
+                            print("🌟 Running UNIFIED PSLD+UGD sampling (hybrid mode)...")
+                            # Hybrid mode: pass both UGD and PSLD parameters
                             samples_ddim, _ = sampler.sample(S=opt.ddim_steps,
                                                             conditioning=c,
                                                             batch_size=opt.n_samples,
@@ -694,9 +770,36 @@ def main():
                                                             x_T=start_code,
                                                             # UGD parameters
                                                             guidance_cfg=guidance_cfg,
-                                                            guidance_fn=guidance_fn)
+                                                            guidance_fn=guidance_fn,
+                                                            # PSLD parameters
+                                                            ip_mask = dps_mask if measure_config['operator']['name'] == 'inpainting' else None,
+                                                            measurements = y_n,
+                                                            operator = operator,
+                                                            gamma = opt.gamma,
+                                                            inpainting = opt.inpainting,
+                                                            omega = opt.omega,
+                                                            general_inverse=opt.general_inverse,
+                                                            noiser=noiser,
+                                                            reference_image=org_image)
+                        elif guidance_cfg and guidance_cfg.enabled:
+                            print("🎯 Running UGD-only sampling...")
+                            # UGD-only mode: just guidance parameters
+                            samples_ddim, _ = sampler.sample(S=opt.ddim_steps,
+                                                            conditioning=c,
+                                                            batch_size=opt.n_samples,
+                                                            shape=shape,
+                                                            verbose=False,
+                                                            unconditional_guidance_scale=opt.scale,
+                                                            unconditional_conditioning=uc,
+                                                            eta=opt.ddim_eta,
+                                                            x_T=start_code,
+                                                            # UGD parameters
+                                                            guidance_cfg=guidance_cfg,
+                                                            guidance_fn=guidance_fn,
+                                                            reference_image=org_image)
                         else:
                             print("📊 Running standard PSLD sampling...")
+                            # PSLD-only mode: just measurement parameters
                             samples_ddim, _ = sampler.sample(S=opt.ddim_steps,
                                                             conditioning=c,
                                                             batch_size=opt.n_samples,
@@ -713,7 +816,8 @@ def main():
                                                             inpainting = opt.inpainting,
                                                             omega = opt.omega,
                                                             general_inverse=opt.general_inverse,
-                                                            noiser=noiser)
+                                                            noiser=noiser,
+                                                            reference_image=org_image)
 
                         x_samples_ddim = model.decode_first_stage(samples_ddim)
                         x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)

@@ -506,7 +506,8 @@ def main():
                                                         omega = opt.omega,
                                                         general_inverse=opt.general_inverse,
                                                         noiser=noiser,
-                                                        ffhq256=opt.ffhq256)
+                                                        ffhq256=opt.ffhq256,
+                                                        reference_image=org_image)
                     else:
                         #pdb.set_trace()
                         if opt.scale != 1.0 :
@@ -531,7 +532,8 @@ def main():
                                                         inpainting = opt.inpainting,
                                                         omega = opt.omega,
                                                         general_inverse=opt.general_inverse,
-                                                        noiser=noiser)
+                                                        noiser=noiser,
+                                                        reference_image=org_image)
 
 
                     x_samples_ddim = model.decode_first_stage(samples_ddim)

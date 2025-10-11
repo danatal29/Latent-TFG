@@ -37,10 +37,11 @@ class UGDDDIMSampler(DDIMSampler):
             self.tensorboard_logger = get_tensorboard_logger(
                 experiment_name="ugd_style_guidance"
             )
-            self.log_step = 0
+            self.reference_image_logged = False  # Track if we've logged reference image
+            self.log_step = 0  # Sequential counter for all logged items
         except ImportError:
-            print("Warning: tensorboard_logger not available, logging disabled")
             self.tensorboard_logger = None
+            self.reference_image_logged = False
             self.log_step = 0
 
     def p_sample_ddim(self, x, c, t, index, repeat_noise=False, use_original_steps=False, quantize_denoised=False,
@@ -105,6 +106,9 @@ class UGDDDIMSampler(DDIMSampler):
             # Optimize over x_t (or z_t) IN-PLACE for num_steps
             x_t = x.detach().clone().requires_grad_(True)
 
+            # Check if normalization is enabled in the config, default to True if not specified
+            normalize_grad = getattr(guidance_cfg, 'normalize_grad', True)
+
             # --- BEFORE the loop (once per outer timestep) ---
             # make a fresh, leaf variable for the inner optimization
 
@@ -136,7 +140,8 @@ class UGDDDIMSampler(DDIMSampler):
                         # Optional clamp (keeps grads but beware saturation -> zero grad at bounds)
                         if guidance_cfg.decode_kwargs and 'clamp' in guidance_cfg.decode_kwargs:
                             lo, hi = guidance_cfg.decode_kwargs['clamp']
-                            img = torch.clamp(img, lo, hi)
+                            print(f"&&&&&&&&&&&&&&&&&&&&& Clamping image to {lo} and {hi}")
+                            img = torch.clamp(img,-1, 1)
 
                         loss = guidance_fn(img, timestep=int(t[0]), index=index)
                     else:
@@ -161,52 +166,44 @@ class UGDDDIMSampler(DDIMSampler):
 
                 # ===== update x_t without tracking (optimizer-free GD step) =====
                 with torch.no_grad():
+                    # <<<<<<< NEW: Conditionally normalize the gradient >>>>>>>
+                    # This stabilizes the optimization by ensuring a consistent step size,
+                    # preventing large gradients from causing chaotic updates.
+                    if normalize_grad:
+                        grad = grad / (grad.norm().clamp_min(1e-6))
                     # optional stabilization
                     # grad = grad / (grad.norm().clamp_min(1e-6))
-                    x_t_prev = x_t.clone()  # Store previous for step size calculation
                     x_t.add_(- guidance_cfg.step_wt * grad)
-                    
-                    # Calculate actual step size taken
-                    step_size_taken = (x_t - x_t_prev).norm()
 
                 # re-leaf for next inner iteration (except after the last)
                 if step_idx < guidance_cfg.num_steps - 1:
                     x_t = x_t.detach().requires_grad_(True)
 
-                # Logging for each inner step
-                gnorm = float(grad.norm().detach().cpu())
-                lval  = float(loss.detach().cpu())
-                x_t_norm = float(x_t.norm().detach().cpu())
-                
-                print(f"✅ UGD step {step_idx}: loss={lval:.6f}, grad_norm={gnorm:.6f}")
-                
-                # TensorBoard logging - metrics only during inner loop
-                if self.tensorboard_logger is not None:
-                    # Log metrics for this inner optimization step
-                    metrics_to_log = {
+                # TensorBoard logging for inner loop
+                if step_idx % 1 == 0:
+                    gnorm = float(grad.norm().detach().cpu())
+                    lval  = float(loss.detach().cpu())
+                    pnorm = float(x_t.norm().detach().cpu())
+                    
+                    # Log inner loop metrics
+                    self.tensorboard_logger.log_metrics({
                         'ugd_inner/loss': lval,
                         'ugd_inner/gradient_norm': gnorm,
-                        'ugd_inner/parameter_norm': x_t_norm,
-                        'ugd_inner/step_size': step_size_taken.item(),
+                        'ugd_inner/parameter_norm': pnorm,
+                        'ugd_inner/step_size': guidance_cfg.step_wt,
                         'ugd_inner/learning_rate': guidance_cfg.step_wt,
-                    }
-                    
-                    self.tensorboard_logger.log_metrics(metrics_to_log, step=self.log_step)
-                    
-                    # Log gradient statistics
-                    self.tensorboard_logger.log_gradients(grad, step=self.log_step)
-                    
-                    # Log latent statistics
-                    self.tensorboard_logger.log_latent_stats(x_t, step=self.log_step)
-                    
-                    # NOTE: Not logging images during inner loop - they're intermediate states and look bad
-                    # Images will be logged after inner loop completes with the final optimized result
-                    
+                        'ugd_inner/k_recur': guidance_cfg.k_recur,
+                        'ugd_inner/normalize_grad': float(guidance_cfg.normalize_grad),
+                        'ugd_inner/inner_step': step_idx,
+                        'ugd_inner/outer_step': index,
+                    }, step=self.log_step)
                     self.log_step += 1
+                    
+                    print(f"✅ UGD step {step_idx}: loss={lval:.6f}, grad_norm={gnorm:.6f}")
 
             # use improved state for the outer DDIM update
             x = x_t.detach()
-            
+
             # Re-evaluate e_t, pred_x0 with the final optimized x
             if unconditional_conditioning is None or unconditional_guidance_scale == 1.:
                 e_t = self.model.apply_model(x, t, c)
@@ -217,29 +214,45 @@ class UGDDDIMSampler(DDIMSampler):
                 e_t_uncond, e_t = self.model.apply_model(x_in, t_in, c_in).chunk(2)
                 e_t = e_t_uncond + unconditional_guidance_scale * (e_t - e_t_uncond)
             
-            # Recompute pred_x0 with optimized x - this is our prediction of clean x_0 from optimized x_t
+            # Recompute pred_x0 with optimized x
             pred_x0 = (x - sqrt_one_minus_at * e_t) / a_t.sqrt()
             
-            # Log summary and the pred_x0 (our guess at x_0 from the optimized x_t)
-            if self.tensorboard_logger is not None:
-                with torch.no_grad():
-                    final_loss = float(loss.detach().cpu())
-                    metrics_summary = {
-                        'ugd_outer/final_inner_loss': final_loss,
-                        'ugd_outer/num_inner_steps': guidance_cfg.num_steps,
-                    }
-                    self.tensorboard_logger.log_metrics(metrics_summary, step=self.log_step)
-                    
-                    # Decode pred_x0 to image space - this is our guess at what x_0 looks like
-                    # pred_x0 is in latent space, decode it to RGB image for visualization
-                    pred_x0_image = self.model.decode_first_stage(pred_x0)
-                    
-                    # Log every outer step to see progression
-                    self.tensorboard_logger.log_image(pred_x0_image, 
-                                                    name=f"ugd_pred_x0_optimized", 
-                                                    step=self.log_step, 
-                                                    every_n_steps=1)
-                    print(f"📸 Logged pred_x0 (optimized) at outer step {index}, timestep {int(t[0])}, log_step {self.log_step}")
+            # TensorBoard logging for outer loop (after inner optimization completes)
+            # Log the final optimized state
+            with torch.no_grad():
+                # Compute final loss
+                decoded_x = self.model.decode_first_stage(pred_x0.detach())
+                final_loss = guidance_fn(decoded_x, timestep=int(t[0]), index=index)
+                
+                # Log outer loop metrics
+                self.tensorboard_logger.log_metrics({
+                    'ugd_outer/final_inner_loss': float(final_loss.cpu()),
+                    'ugd_outer/num_inner_steps': guidance_cfg.num_steps,
+                    'ugd_outer/k_recur': guidance_cfg.k_recur,
+                    'ugd_outer/normalize_grad': float(guidance_cfg.normalize_grad),
+                    'ugd_outer/outer_step_index': index,
+                    'ugd_outer/diffusion_timestep': int(t[0]),
+                }, step=self.log_step)
+                
+                # Log the optimized pred_x0 as an image
+                # Decode pred_x0 to image space for visualization
+                pred_x0_img = self.model.decode_first_stage(pred_x0.detach())
+                # Normalize to [0, 1] for visualization
+                pred_x0_img_normalized = (pred_x0_img + 1.0) / 2.0
+                pred_x0_img_normalized = torch.clamp(pred_x0_img_normalized, 0.0, 1.0)
+                
+                # Log image (handle batch dimension)
+                if pred_x0_img_normalized.dim() == 4:
+                    pred_x0_img_normalized = pred_x0_img_normalized[0]
+                
+                self.tensorboard_logger.log_image(
+                    pred_x0_img_normalized,
+                    name='ugd_pred_x0_optimized',
+                    step=self.log_step,
+                    every_n_steps=1
+                )
+                
+                self.log_step += 1
 
         # 6) Continue with standard DDIM direction/noise synthesis
         if quantize_denoised:
@@ -253,21 +266,6 @@ class UGDDDIMSampler(DDIMSampler):
             noise = torch.nn.functional.dropout(noise, p=noise_dropout)
             
         x_prev = a_prev.sqrt() * pred_x0 + dir_xt + noise
-        
-        # Log scale parameters only (image already logged after inner loop)
-        if self.tensorboard_logger is not None:
-            with torch.no_grad():
-                # Log scale parameters (similar to PSLD)
-                self.tensorboard_logger.log_scale_parameters(
-                    unconditional_guidance_scale=unconditional_guidance_scale,
-                    diffusion_timestep=int(t[0]) if hasattr(t, '__getitem__') else int(t),
-                    step=self.log_step
-                )
-                
-                # Don't log image here - already logged after inner loop optimization
-                # This avoids duplicate/redundant images
-                
-                self.log_step += 1
         
         return x_prev, pred_x0
 
@@ -296,6 +294,7 @@ class UGDDDIMSampler(DDIMSampler):
                # UGD parameters
                guidance_cfg: Optional[GuidanceConfig] = None,
                guidance_fn: Optional[GuidanceFn] = None,
+               reference_image=None,  # Reference image path or tensor for TensorBoard
                **kwargs):
         """
         Enhanced sample method with UGD guidance support.
@@ -303,6 +302,7 @@ class UGDDDIMSampler(DDIMSampler):
         Additional parameters:
         - guidance_cfg: GuidanceConfig for UGD settings
         - guidance_fn: GuidanceFn for computing guidance loss
+        - reference_image: Reference/style image to log in TensorBoard (path, PIL, or tensor)
         """
         if conditioning is not None:
             if isinstance(conditioning, dict):
@@ -318,6 +318,51 @@ class UGDDDIMSampler(DDIMSampler):
         C, H, W = shape
         size = (batch_size, C, H, W)
         print(f'Data shape for DDIM sampling is {size}, eta {eta}')
+        
+        # Log reference image once at the beginning
+        if self.tensorboard_logger is not None and reference_image is not None and not self.reference_image_logged:
+            with torch.no_grad():
+                # Ensure reference image is in correct format
+                if isinstance(reference_image, torch.Tensor):
+                    ref_img = reference_image
+                else:
+                    # If it's a path or PIL image, convert it
+                    from PIL import Image
+                    import torchvision.transforms as transforms
+                    if isinstance(reference_image, str):
+                        ref_img = Image.open(reference_image)
+                    else:
+                        ref_img = reference_image
+                    
+                    # Convert PIL to tensor if needed
+                    if not isinstance(ref_img, torch.Tensor):
+                        transform = transforms.Compose([
+                            transforms.ToTensor(),
+                        ])
+                        ref_img = transform(ref_img)
+                
+                # Move to correct device if needed
+                if hasattr(self.model, 'device'):
+                    device = self.model.device
+                elif hasattr(self, 'device'):
+                    device = self.device
+                else:
+                    device = _get_device()
+                    
+                if ref_img.device != device:
+                    ref_img = ref_img.to(device)
+                
+                # Ensure 3D (CHW)
+                if ref_img.dim() == 4:
+                    ref_img = ref_img[0]  # Take first image if batch
+                
+                # Log the reference image
+                self.tensorboard_logger.log_image(ref_img, 
+                                                name="reference_image", 
+                                                step=0, 
+                                                every_n_steps=1)
+                self.reference_image_logged = True
+                print(f"📸 Logged reference image to TensorBoard")
 
         # Use no_grad for standard operations, but allow gradients for UGD
         if guidance_cfg and guidance_cfg.enabled and guidance_fn:
@@ -391,42 +436,129 @@ class UGDDDIMSampler(DDIMSampler):
         total_steps = timesteps if ddim_use_original_steps else timesteps.shape[0]
         print(f"Running DDIM Sampling with {total_steps} timesteps")
 
+        # Get k from your config for self-recurrence, defaulting to 1 (no recurrence).
+        # [cite_start]This is the number of times the denoise/re-noise process is repeated per timestep[cite: 180].
+        k_recur = 1
+        if guidance_cfg and hasattr(guidance_cfg, 'k_recur'):
+             k_recur = guidance_cfg.k_recur
+        if k_recur > 1:
+            print(f"Using Per-step Self-recurrence with k={k_recur} iterations per step.")
+            
+        # Log sampling configuration to TensorBoard
+        if self.tensorboard_logger is not None:
+            sampling_metrics = {
+                'sampling/k_recur': k_recur,
+                'sampling/total_timesteps': total_steps,
+                'sampling/ddim_eta': getattr(self, 'ddim_eta', 0.0),
+            }
+            if guidance_cfg:
+                sampling_metrics.update({
+                    'sampling/normalize_grad': float(guidance_cfg.normalize_grad),
+                    'sampling/guidance_steps': guidance_cfg.num_steps,
+                    'sampling/guidance_weight': guidance_cfg.step_wt,
+                })
+            # Add unconditional guidance scale if available
+            if 'unconditional_guidance_scale' in kwargs:
+                sampling_metrics['sampling/guidance_scale'] = kwargs['unconditional_guidance_scale']
+            self.tensorboard_logger.log_metrics(sampling_metrics, step=0)
+
+
         iterator = tqdm(time_range, desc='DDIM Sampler', total=total_steps)
 
+        # DEBUG: Print initial alpha schedule info
+        print(f"🔍 DEBUG: DDIM Alpha Schedule Analysis")
+        print(f"   Total steps: {total_steps}")
+        print(f"   DDIM alphas shape: {self.ddim_alphas.shape}")
+        print(f"   DDIM alphas_prev shape: {self.ddim_alphas_prev.shape}")
+        print(f"   First few alphas: {self.ddim_alphas[:5]}")
+        print(f"   First few alphas_prev: {self.ddim_alphas_prev[:5]}")
+        print(f"   Last few alphas: {self.ddim_alphas[-5:]}")
+        print(f"   Last few alphas_prev: {self.ddim_alphas_prev[-5:]}")
+        
         for i, step in enumerate(iterator):
             index = total_steps - i - 1
             ts = torch.full((b,), step, device=device, dtype=torch.long)
+            
+            # DEBUG: Print timestep info for first few steps
+            if i < 3:
+                a_t_current = self.ddim_alphas[index] if index < len(self.ddim_alphas) else "N/A"
+                a_prev_current = self.ddim_alphas_prev[index] if index < len(self.ddim_alphas_prev) else "N/A"
+                print(f"🔍 DEBUG Timestep {i}: index={index}, step={step}, a_t={a_t_current}, a_prev={a_prev_current}")
 
             if mask is not None:
                 assert x0 is not None
                 img_orig = self.model.q_sample(x0, ts)  # TODO: deterministic forward pass?
                 img = img_orig * mask + (1. - mask) * img
 
-            # Log outer diffusion step info
-            if self.tensorboard_logger is not None:
-                with torch.no_grad():
-                    # Log diffusion progress
-                    self.tensorboard_logger.log_scale_parameters(
-                        diffusion_timestep=int(step),
-                        total_steps=int(total_steps),
-                        current_step=int(index),
-                        step=self.log_step
-                    )
+            current_k = k_recur if index > 0 else 1
 
-            # Call UGD-enhanced p_sample_ddim
-            outs = self.p_sample_ddim(img, cond, ts, index=index, 
-                                      use_original_steps=ddim_use_original_steps,
-                                      quantize_denoised=quantize_denoised, 
-                                      temperature=temperature,
-                                      noise_dropout=noise_dropout, 
-                                      score_corrector=score_corrector,
-                                      corrector_kwargs=corrector_kwargs,
-                                      unconditional_guidance_scale=unconditional_guidance_scale,
-                                      unconditional_conditioning=unconditional_conditioning,
-                                      # Pass UGD parameters
-                                      guidance_cfg=guidance_cfg,
-                                      guidance_fn=guidance_fn)
-            img, pred_x0 = outs
+
+            for k_idx in range(current_k):
+                            # 1. DENOISE STEP: Call the UGD-enhanced p_sample_ddim.
+                            # It takes the current noisy latent `img` (x_t) and produces a less noisy version (x_{t-1}).
+                            outs = self.p_sample_ddim(img, cond, ts, index=index,
+                                                    use_original_steps=ddim_use_original_steps,
+                                                    quantize_denoised=quantize_denoised,
+                                                    temperature=temperature,
+                                                    noise_dropout=noise_dropout,
+                                                    score_corrector=score_corrector,
+                                                    corrector_kwargs=corrector_kwargs,
+                                                    unconditional_guidance_scale=unconditional_guidance_scale,
+                                                    unconditional_conditioning=unconditional_conditioning,
+                                                    guidance_cfg=guidance_cfg,
+                                                    guidance_fn=guidance_fn)
+                            x_prev, pred_x0 = outs
+
+                            # 2. RE-NOISE STEP: Add noise back to x_{t-1} to bring it to the noise level of x_t.
+                            # This step is skipped on the final iteration of the recurrence loop.
+                            if k_idx < k_recur - 1:
+                                # DEBUG: Verify a_t and a_prev values before re-noising
+                                a_t_val = self.ddim_alphas[index]
+                                a_prev_val = self.ddim_alphas_prev[index]
+                                ratio = a_t_val / a_prev_val
+                                sqrt_term = 1 - ratio
+                                
+                                print(f"🔍 DEBUG Self-Recurrence Step {k_idx+1}/{k_recur}:")
+                                print(f"   Index: {index}, Timestep: {step}")
+                                print(f"   a_t (α_t): {a_t_val:.6f}")
+                                print(f"   a_prev (α_t-1): {a_prev_val:.6f}")
+                                print(f"   Ratio (a_t/a_prev): {ratio:.6f}")
+                                print(f"   (1 - ratio): {sqrt_term:.6f}")
+                                print(f"   sqrt(1 - ratio): {torch.sqrt(torch.tensor(max(sqrt_term, 1e-8))):.6f}")
+                                
+                                # Check for potential issues
+                                if ratio >= 1.0:
+                                    print(f"⚠️  WARNING: a_t <= a_prev! This should not happen in normal DDIM sampling.")
+                                if sqrt_term >= 0:
+                                    print(f"⚠️  WARNING: (1 - a_t/a_prev) <= 0! Using small epsilon to avoid negative sqrt.")
+                                    sqrt_term = 1e-8
+                                
+                                # [cite_start]This is Equation (10) from the UGD paper[cite: 178].
+                                a_t = torch.full((b, 1, 1, 1), a_t_val, device=device)
+                                a_prev = torch.full((b, 1, 1, 1), a_prev_val, device=device)
+
+                                alpha_ratio = a_t / a_prev
+
+                                #
+                                # --- ROBUSTNESS FIX ---
+                                # Clamp the ratio to prevent sqrt of a negative number due to float precision.
+                                # This is the key change to prevent NaN propagation.
+                                #
+                                alpha_ratio = torch.clamp(alpha_ratio, min=1e-8, max=1.0 - 1e-8)
+
+                                # Get the coefficient for the previous state (x_{t-1})
+                                coeff_x_prev = alpha_ratio.sqrt()
+                                # Get the coefficient for the noise
+                                coeff_noise = (1.0 - alpha_ratio).sqrt()
+
+                                # Apply the re-noising using the robust coefficients
+                                img = coeff_x_prev * x_prev + coeff_noise * torch.randn_like(x_prev)
+
+                            else:
+                                # On the final recurrence step, the result becomes the input for the next main DDIM step.
+                                img = x_prev
+                        # <<<<<<< END of Self-Recurrence Loop >>>>>>>
+
             if callback: callback(i)
             if img_callback: img_callback(pred_x0, i)
 
@@ -434,14 +566,26 @@ class UGDDDIMSampler(DDIMSampler):
                 intermediates['x_inter'].append(img)
                 intermediates['pred_x0'].append(pred_x0)
                 
-                # Log intermediate pred_x0 at key checkpoints
-                if self.tensorboard_logger is not None:
-                    with torch.no_grad():
-                        decoded_pred_x0 = self.model.decode_first_stage(pred_x0)
-                        self.tensorboard_logger.log_image(decoded_pred_x0, 
-                                                        name=f"diffusion_pred_x0", 
-                                                        step=self.log_step, 
-                                                        every_n_steps=1)
-                        print(f"📸 Logged pred_x0 at diffusion step {index}/{total_steps}")
+                # TensorBoard logging for intermediate checkpoints
+                # Log intermediate pred_x0 images at checkpoints
+                with torch.no_grad():
+                    # Decode pred_x0 to image space
+                    pred_x0_img = self.model.decode_first_stage(pred_x0.detach())
+                    # Normalize to [0, 1]
+                    pred_x0_img_normalized = (pred_x0_img + 1.0) / 2.0
+                    pred_x0_img_normalized = torch.clamp(pred_x0_img_normalized, 0.0, 1.0)
+                    
+                    # Handle batch dimension
+                    if pred_x0_img_normalized.dim() == 4:
+                        pred_x0_img_normalized = pred_x0_img_normalized[0]
+                    
+                    # Log checkpoint image
+                    self.tensorboard_logger.log_image(
+                        pred_x0_img_normalized,
+                        name='diffusion_checkpoint',
+                        step=self.log_step,
+                        every_n_steps=1
+                    )
+                    self.log_step += 1
 
         return img, intermediates

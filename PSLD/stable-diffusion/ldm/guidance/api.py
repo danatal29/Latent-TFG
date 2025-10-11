@@ -17,5 +17,7 @@ class GuidanceConfig:
     domain: Domain = "image"     # "latent" for PSLD-in-latent; "image" for image-space
     num_steps: int = 5
     step_wt: float = 5.0         # like UGD's --optim_forward_guidance_wt
+    k_recur: int = 1             # Number of self-recurrence iterations per timestep
+    normalize_grad: bool = True  # Whether to normalize gradients during optimization
     decode_kwargs: Optional[Dict] = None  # e.g., clamp, range, VAE fp
 
