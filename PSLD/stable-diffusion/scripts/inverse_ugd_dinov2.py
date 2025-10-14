@@ -120,12 +120,17 @@ def check_safety(x_image):
 
 def create_style_guidance_function(style_image_path, device, operator):
     """
-    Create UGD style guidance function using PSLD's existing operator.
+    Create UGD style guidance function using PSLD's DINOv2 StyleOperator.
+    
+    This function uses DINOv2 for texture extraction which is better at capturing:
+    - Fine-grained texture patterns (e.g., brush strokes, paint texture)
+    - Low-level visual features without semantic bias
+    - Spatial patterns and directional textures
     
     Args:
         style_image_path: Path to style reference image
         device: torch device
-        operator: PSLD operator from config (reused for consistency)
+        operator: PSLD DINOv2 StyleOperator from config
     
     Returns:
         style_guidance_fn: Function that computes style loss for UGD
@@ -137,6 +142,12 @@ def create_style_guidance_function(style_image_path, device, operator):
     if operator is None:
         print(f"⚠️  No operator provided - cannot create guidance")
         return None
+    
+    # Verify we're using DINOv2 operator
+    operator_name = operator.__class__.__name__
+    if 'CLIP' in operator_name:
+        print(f"⚠️  WARNING: This script is designed for DINOv2 StyleOperator, but {operator_name} was provided!")
+        print(f"⚠️  For better texture extraction, please use 'style_retrieval' operator in your config, not 'clip_style_retrieval'")
         
     # Try to resolve the path relative to current working directory
     if not os.path.exists(style_image_path):
@@ -165,7 +176,7 @@ def create_style_guidance_function(style_image_path, device, operator):
     
     try:
         print(f"🎨 Loading style guidance from: {style_image_path}")
-        print(f"🎨 Using PSLD operator: {operator.__class__.__name__}")
+        print(f"🎨 Using DINOv2 operator: {operator.__class__.__name__}")
         
         # Load and preprocess target style image using torch operations for consistency
         style_img = Image.open(style_image_path).convert('RGB')
@@ -182,14 +193,14 @@ def create_style_guidance_function(style_image_path, device, operator):
                 style_tensor, size=(512, 512), mode='bilinear', align_corners=False
             )
         
-        # Extract target style features using PSLD's operator
+        # Extract target style features using DINOv2 operator
         with torch.no_grad():
             target_features = operator.forward(style_tensor)
-            print(f"✅ Extracted target style features: shape={target_features.shape}")
+            print(f"✅ Extracted target DINOv2 style features: shape={target_features.shape}")
         
         def style_guidance_fn(pred_img, **kwargs):
             """
-            UGD style guidance function using PSLD's operator.
+            UGD style guidance function using DINOv2 StyleOperator.
             
             Args:
                 pred_img: Predicted image in [-1, 1] range (from decoded latent)
@@ -198,7 +209,7 @@ def create_style_guidance_function(style_image_path, device, operator):
                 style_loss: Scalar loss for gradient computation
             """
             try:
-                # Extract style from predicted image using PSLD operator
+                # Extract style from predicted image using DINOv2 operator
                 # pred_img should already be in [-1, 1] range from decoder
                 pred_features = operator.forward(pred_img)
                 
@@ -221,7 +232,7 @@ def create_style_guidance_function(style_image_path, device, operator):
                 traceback.print_exc()
                 return torch.tensor(0.0, device=pred_img.device, requires_grad=True)
         
-        print(f"✅ Style guidance function created successfully")
+        print(f"✅ DINOv2 style guidance function created successfully")
         return style_guidance_fn  # Return only the guidance function
         
     except Exception as e:
@@ -237,7 +248,7 @@ def create_ugd_guidance_config(opt, operator):
     
     Args:
         opt: Command line options
-        operator: PSLD operator from config (reused for style extraction)
+        operator: PSLD DINOv2 StyleOperator from config
     
     Returns:
         guidance_cfg: GuidanceConfig object or None
@@ -247,14 +258,14 @@ def create_ugd_guidance_config(opt, operator):
         print("📊 UGD guidance disabled - using standard PSLD")
         return None, None
         
-    print("🎯 Attempting to create UGD guidance configuration...")
+    print("🎯 Attempting to create UGD guidance configuration with DINOv2...")
         
     # Create guidance function based on type
     guidance_fn = None
     device = _get_device()
     
     if opt.style_image:
-        print(f"🎨 Creating style guidance for: {opt.style_image}")
+        print(f"🎨 Creating DINOv2 style guidance for: {opt.style_image}")
         guidance_fn = create_style_guidance_function(opt.style_image, device, operator)
     else:
         print("⚠️  UGD guidance enabled but no style_image specified")
@@ -277,7 +288,7 @@ def create_ugd_guidance_config(opt, operator):
         decode_kwargs={'clamp': (-1, 1)} if opt.guidance_domain == "image" else None
     )
         
-    print(f"✅ UGD Guidance configured successfully:")
+    print(f"✅ UGD Guidance configured successfully with DINOv2:")
     print(f"  - Domain: {guidance_cfg.domain}")
     print(f"  - Steps: {guidance_cfg.num_steps}")
     print(f"  - Weight: {guidance_cfg.step_wt}")
@@ -652,7 +663,7 @@ def main():
             
         print(f"✅ Text encoder moved to {device}")
 
-    # Setup PSLD components FIRST - need operator before creating UGD guidance
+    # Setup PSLD components FIRST - need DINOv2 operator before creating UGD guidance
     sys.path.append(opt.dps_path)
 
     import yaml
@@ -685,8 +696,16 @@ def main():
     noiser = get_noise(**measure_config['noise'])
     
     print(f"✅ Loaded PSLD operator: {operator.__class__.__name__}")
+    
+    # Verify we're using DINOv2 operator
+    if measure_config['operator']['name'] == 'clip_style_retrieval':
+        print(f"⚠️  WARNING: Config uses 'clip_style_retrieval' but this script is designed for DINOv2!")
+        print(f"⚠️  Please change operator name to 'style_retrieval' in your task config for DINOv2")
+        print(f"⚠️  DINOv2 is better at texture extraction than CLIP for style transfer")
+    elif measure_config['operator']['name'] == 'style_retrieval':
+        print(f"✅ Using DINOv2 StyleOperator for superior texture extraction!")
 
-    # Create UGD guidance configuration using PSLD's operator
+    # Create UGD guidance configuration using DINOv2 operator
     guidance_cfg, guidance_fn = create_ugd_guidance_config(opt, operator)
 
     # Create sampler based on mode
@@ -694,7 +713,7 @@ def main():
         from ldm.models.diffusion.ugd_psld_sampler import UnifiedPSLDUGDSampler
         from ldm.guidance.api import UnifiedConfig
         
-        print("🌟 Using UNIFIED PSLD+UGD sampler (alternating timesteps)")
+        print("🌟 Using UNIFIED PSLD+UGD sampler (alternating timesteps) with DINOv2")
         print(f"   - Schedule mode: {opt.schedule_mode}")
         if opt.schedule_mode == "pattern":
             print(f"   - Pattern: {opt.pattern_type}")
@@ -721,12 +740,12 @@ def main():
         # Store unified_cfg for use in sampling
         sampler.unified_cfg = unified_cfg
     elif opt.use_hybrid_sampler:
-        print("🌟 Using UNIFIED PSLD+UGD sampler (hybrid mode)")
+        print("🌟 Using UNIFIED PSLD+UGD sampler (hybrid mode) with DINOv2")
         print("   - Combines UGD inner optimization with PSLD measurement consistency")
         print("   - Best quality: strong style matching + structural preservation")
         sampler = PSLDUGDSampler(model)
     elif guidance_cfg and guidance_cfg.enabled:
-        print("🚀 Using UGD-only DDIM sampler")
+        print("🚀 Using UGD-only DDIM sampler with DINOv2")
         print("   - Inner optimization loop for style guidance")
         sampler = UGDDDIMSampler(model)
     else:
@@ -793,8 +812,9 @@ def main():
         y = operator.forward(org_image, mask=dps_mask)
         y_n = noiser(y)
 
-    elif (measure_config['operator']['name'] == 'clip_style_retrieval') or (measure_config['operator']['name'] == 'style_retrieval'):
-        # Style operators: NO noise should be added to style features
+    elif measure_config['operator']['name'] == 'style_retrieval':
+        # DINOv2 Style operator: NO noise should be added to style features
+        print("🎨 Extracting style features with DINOv2 operator...")
         y = operator.forward(org_image)
         y_n = y  # Keep original style features without noise
         dps_mask = None
@@ -858,15 +878,16 @@ def main():
                             # Task configuration
                             'task_config': opt.task_config if hasattr(opt, 'task_config') else 'none',
                             'operator': operator.__class__.__name__ if operator else 'none',
+                            'operator_type': 'DINOv2',  # Explicitly mark as DINOv2
                             'style_image': opt.style_image if hasattr(opt, 'style_image') else 'none',
                             'file_id': opt.file_id if hasattr(opt, 'file_id') else 'none',
                         }
 
                         # =====================================
-                        # SAMPLING: PSLD / UGD / HYBRID / UNIFIED
+                        # SAMPLING: PSLD / UGD / HYBRID / UNIFIED with DINOv2
                         # =====================================
                         if opt.use_unified_sampler:
-                            print("🌟 Running UNIFIED PSLD+UGD sampling (alternating timesteps)...")
+                            print("🌟 Running UNIFIED PSLD+UGD sampling (alternating timesteps) with DINOv2...")
                             # Unified mode: pass unified_cfg along with both PSLD and UGD parameters
                             samples_ddim, _ = sampler.sample(S=opt.ddim_steps,
                                                             conditioning=c,
@@ -896,7 +917,7 @@ def main():
                                                             prompt=prompts[0] if prompts else "",
                                                             config_dict=config_dict)
                         elif opt.use_hybrid_sampler:
-                            print("🌟 Running UNIFIED PSLD+UGD sampling (hybrid mode)...")
+                            print("🌟 Running UNIFIED PSLD+UGD sampling (hybrid mode) with DINOv2...")
                             # Hybrid mode: pass both UGD and PSLD parameters
                             samples_ddim, _ = sampler.sample(S=opt.ddim_steps,
                                                             conditioning=c,
@@ -921,7 +942,7 @@ def main():
                                                             noiser=noiser,
                                                             reference_image=org_image)
                         elif guidance_cfg and guidance_cfg.enabled:
-                            print("🎯 Running UGD-only sampling...")
+                            print("🎯 Running UGD-only sampling with DINOv2...")
                             # UGD-only mode: just guidance parameters
                             samples_ddim, _ = sampler.sample(S=opt.ddim_steps,
                                                             conditioning=c,
@@ -993,3 +1014,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

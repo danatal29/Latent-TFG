@@ -198,20 +198,18 @@ class StyleOperator(NonLinearOperator):
         pil_img -> normalized style vector from multiple hidden states.
         `layers` are indices into hidden_states (negative = from the end).
         """
-        #inputs = self.processor(images=pil_img, return_tensors="pt").to(self.device)
+        # 1. Ensure batch dimension
+        if img_tensor.dim() == 3:
+            img_tensor = img_tensor.unsqueeze(0)  # Add batch dimension
         
-        # 1. Differentiable Resizing
+        # 2. Differentiable Resizing
         # DINOv2 expects a 224x224 input.
         # The image tensor is in the range [0, 1] after the clamp operation.
         # Use F.interpolate instead of T.Resize to avoid MPS issues
         if img_tensor.shape[-1] != 224 or img_tensor.shape[-2] != 224:
-            if img_tensor.dim() == 3:
-                img_tensor = img_tensor.unsqueeze(0)  # Add batch dimension
             img_tensor = F.interpolate(img_tensor, size=(224, 224), mode='bilinear', align_corners=False)
-            if img_tensor.shape[0] == 1:
-                img_tensor = img_tensor.squeeze(0)  # Remove batch dimension if it was added
 
-        # 2. Differentiable Normalization
+        # 3. Differentiable Normalization
         # DINOv2's mean and std
         norm_mean = torch.tensor([0.485, 0.456, 0.406], device=img_tensor.device).view(1, 3, 1, 1)
         norm_std = torch.tensor([0.229, 0.224, 0.225], device=img_tensor.device).view(1, 3, 1, 1)
@@ -219,11 +217,8 @@ class StyleOperator(NonLinearOperator):
         # Apply normalization to the tensor
         inputs = (img_tensor - norm_mean) / norm_std
 
-        # Ensure we have batch dimension
-        if inputs.dim() == 3:
-            inputs = inputs.unsqueeze(0)  # [C, H, W] -> [1, C, H, W]
-
-        if img_tensor.requires_grad:
+        # 4. Forward pass through DINOv2
+        if inputs.requires_grad:
             out = self.model(inputs, output_hidden_states=True)
         else:
             with torch.no_grad():
@@ -249,16 +244,8 @@ class StyleOperator(NonLinearOperator):
     def forward(self, data, **kwargs):
         # For differentiable operations, we need to handle tensors directly
         if torch.is_tensor(data):
-
-            #data = torch.clamp((data + 1.0) / 2.0, min=0.0, max=1.0)
-
             # Convert from [-1, 1] to [0, 1] range without reshaping
             data = data.add(1.0).div(2.0).clamp(0.0, 1.0)
-            
-            # For differentiable style extraction, we'll use a simplified approach
-            # that maintains the computational graph
-            if data.dim() == 3:
-                data = data.unsqueeze(0) 
             
             # Use a differentiable style extraction method
             style_vec = self.style_vec(data, **kwargs)
