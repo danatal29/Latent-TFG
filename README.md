@@ -16,7 +16,7 @@ This project implements a **training-free style transfer** pipeline on top of a 
 
 Generated with the unified sampler (prompt content + single style image):
 
-| Venice (Starry-Night-like)             | Temple & Sakura (painterly)   |
+| Venice (Starry-Night-like)             | Temple & Sakura    |
 | -------------------------------------- | ----------------------------- |
 | ![gondola](readmeims/gondola.png) | ![temple](readmeims/temple.png) |
 
