@@ -1,238 +1,136 @@
-# PSLD Style Extraction & Transfer
 
-A powerful system for extracting and transferring artistic styles using Stable Diffusion and CLIP. This repository implements Posterior Sampling with Latent Diffusion (PSLD) for high-quality style transfer with precise control over style adherence.
+---
 
-## 🎨 What This Does
+# Unified Sampler (UGD + PSLD) for Training-Free Style Transfer
 
-Transform any image to match a specific artistic style by:
-- **Style Extraction**: Automatically extract style features from reference images
-- **Style Transfer**: Apply extracted styles to new images with text guidance
-- **Quality Control**: Fine-tune style strength and generation quality
-- **Real-time Monitoring**: Track progress with TensorBoard visualization
+This project implements a **training-free style transfer** pipeline on top of a Stable-Diffusion (LDM) model by **combining**:
 
-## 🚀 Quick Start
+* **UGD (Universal Guided Diffusion)** — forward guidance on (\hat z_0/\hat x_0) with optional **per-step self-recurrence** (denoise→re-noise cycles at the same (t)).
+* **PSLD** — a measurement-consistency term adapted to style transfer (style = “measurement” computed with a differentiable **CLIP-Gram** descriptor).
 
-### 1. Setup
+> In our experiments we **do not** use UGD backward guidance (clean-space optimization). Forward guidance + self-recurrence + PSLD are used.
+
+---
+
+## Teaser
+
+Generated with the unified sampler (prompt content + single style image):
+
+| Venice (Starry-Night-like)             | Temple & Sakura (painterly)   |
+| -------------------------------------- | ----------------------------- |
+| ![gondola](readmeims/gondola.png) | ![temple](readmeims/temple.png) |
+
+
+---
+
+## What’s inside
+
+* **UGD forward guidance** on using a **CLIP-Gram** style operator
+* **Self-recurrence** (k) micro-passes per outer timestep (t) (denoise→re-noise at same (t))
+* **PSLD measurement consistency** (style loss acts as the “measurement”) with a log-SNR schedule (\omega_t)
+* **Alternating schedule**: choose PSLD vs. UGD per timestep (`pattern`, `early_late`, or a custom schedule)
+
+---
+
+## Requirements
+
+* Python 3.10+
+* PyTorch (CUDA or MPS supported)
+* The LDM/Stable-Diffusion codebase this project extends (PSLD-based fork)
+* CLIP (for the style operator) and common vision deps (torchvision, PIL, etc.)
+
+> Tip: install conda env `psld310` from the base repo, this project should run as-is.
+
+---
+
+## Quick start
+
+The repo includes a convenience script:
+
+```
+run/unified_sampler_example.sh
+```
+
+### 1) Basic usage
+
 ```bash
-# Clone the repository
-git clone <repository-url>
-cd projectv2
-
-# Install dependencies (if needed)
-pip install torch transformers clip-by-openai tensorboard omegaconf pillow opencv-python
+bash run/unified_sampler_example.sh 
 ```
 
-### 2. Prepare Your Images
-Place your input images in the `pics/` directory:
+This launches the **UnifiedPSLDUGDSampler** and alternates between PSLD and UGD across timesteps with the chosen pattern. Outputs and intermediate previews go to `--outdir`.
+
+### 2) “Early UGD, Late PSLD” recipe
+
 ```bash
-cp your_image.jpg pics/
+bash run/unified_sampler_example.sh \
+  --prompt "An ancient temple surrounded by cherry blossoms in morning mist" \
+  --style_image /path/to/style.jpg \
+  --ddim_steps 100 \
+  --cfg 7.0 \
+  --schedule_mode early_late \
+  --split_timestep 30 \
+  --psld_weight 0.7 \
+  --ugd_weight 2.5 \
+  --k_recur 2 \
+  --seed 42 \
+  --outdir outputs/temple_sakura
 ```
 
-### 3. Run Style Transfer
-```bash
-cd PSLD/stable-diffusion
+---
 
-# Basic style transfer
-python scripts/inverse.py \
-    --file_id='your_image.jpg' \
-    --task_config='../diffusion-posterior-sampling/configs/style_extraction_config.yaml' \
-    --outdir='outputs/my_style_results' \
-    --prompt='van gogh painting style' \
-    --omega=10 \
-    --ddim_steps=50
-```
+## Command-line flags (explained)
 
-### 4. View Results
-- Generated images: `outputs/my_style_results/samples/`
-- Progress tracking: `tensorboard --logdir=runs --port=6006`
+> Flag names reflect what the script typically forwards into `UnifiedPSLDUGDSampler.sample(...)` and your `GuidanceConfig` / `UnifiedConfig`. If a flag isn’t present in your script yet, you can add it or hard-code the default.
 
-## 📁 Project Structure
+### Core generation
 
-```
-projectv2/
-├── PSLD/
-│   ├── stable-diffusion/           # Main Stable Diffusion implementation
-│   │   ├── scripts/inverse.py     # Main script for style transfer
-│   │   ├── run/inverse.sh         # Example commands
-│   │   └── ldm/models/diffusion/psld.py  # PSLD sampler
-│   ├── diffusion-posterior-sampling/
-│   │   └── configs/style_extraction_config.yaml  # Configuration
-│   └── notebooks/
-│       └── extract_style.ipynb    # Jupyter examples
-├── pics/                          # Your input images go here
-└── outputs/                       # Generated results appear here
-```
+* `--prompt` (str): Text prompt (content).
+* `--style_image` (path): Reference style image used by the **CLIP-Gram** style operator.
+* `--steps` / `-S` (int): Number of DDIM steps (outer timesteps).
+* `--eta` (float, default 0.0): DDIM stochasticity.
+* `--cfg` (float): Classifier-free guidance scale for the UNet (prompt strength).
+* `--seed` (int): RNG seed for reproducibility.
+* `--outdir` (path): Output directory for images and logs.
 
-## ⚙️ Configuration Options
+### Unified scheduler (decides per-timestep method)
 
-### Key Parameters
+* `--schedule_mode` (`pattern`|`early_late`|`custom`): How to choose PSLD vs. UGD at each (t).
+* `--pattern` (`even_odd`|`odd_even`): When `pattern` mode is used, alternate PSLD/UGD on even/odd indices.
+* `--split_timestep` (int): When `early_late` mode is used, timesteps `>= split` use PSLD, earlier ones use UGD.
+* `--psld_weight` (float): Multiplier on PSLD loss term (\omega_t \cdot \mathcal{L}_{style}) (after scheduling).
+* `--ugd_weight` (float): Multiplier on the UGD inner-loop step size (stabilized in code).
 
-| Parameter | Description | Typical Values | Effect |
-|-----------|-------------|----------------|---------|
-| `--omega` | Style constraint strength | 1-20 | Higher = stronger style adherence |
-| `--ddim_steps` | Sampling steps | 20-100 | More steps = better quality, slower |
-| `--scale` | Text guidance strength | 3-15 | Higher = better prompt following |
-| `--ddim_eta` | Sampling randomness | 0-1 | 0 = deterministic, 1 = more random |
+### UGD guidance (forward; inner optimization on (x_t))
 
-### Style Strength Guide
-- **`omega=1-3`**: Subtle style influence
-- **`omega=5-10`**: Balanced style transfer
-- **`omega=10-20`**: Strong style dominance
+* `--step_wt` (float): Base step size for each inner update (scaled in code for stability).
+* `--k_recur` (int): **Self-recurrence** count at a fixed outer (t) (denoise→re-noise cycles).
+* `--normalize_grad` (bool): Normalize the guidance gradient per inner step (recommended).
 
-### Quality vs Speed
-- **Fast**: `ddim_steps=20`, `omega=5`
-- **Balanced**: `ddim_steps=50`, `omega=10`
-- **High Quality**: `ddim_steps=100`, `omega=15`
+### PSLD (style as measurement)
 
-## 🎯 Example Commands
+* `--omega` (float): Global weight for the style term; shaped into (\omega_t) via log-SNR schedule.
+* `--gamma` (float): Extra coefficient for non-style tasks (e.g., inpainting glue); often 0 or small for pure style.
+* `--inpainting` / `--mask` / `--operator`: For inverse-problem variants; for pure style, the operator is the **CLIP-Gram** extractor.
+* `--apply_mid_frac` (e.g., `0.7`): (If present in your script) apply guidance only on the middle % of timesteps to avoid early/late instability.
 
-### Artistic Style Transfer
-```bash
-# Van Gogh style
-python scripts/inverse.py \
-    --file_id='portrait.jpg' \
-    --task_config='../diffusion-posterior-sampling/configs/style_extraction_config.yaml' \
-    --outdir='outputs/van_gogh' \
-    --prompt='van gogh painting with thick brushstrokes' \
-    --omega=12 \
-    --ddim_steps=75
+---
 
-# Watercolor style
-python scripts/inverse.py \
-    --file_id='landscape.jpg' \
-    --task_config='../diffusion-posterior-sampling/configs/style_extraction_config.yaml' \
-    --outdir='outputs/watercolor' \
-    --prompt='soft watercolor painting' \
-    --omega=8 \
-    --ddim_steps=60
-```
+## Output & logging
 
-### Quick Testing
-```bash
-# Fast test run
-python scripts/inverse.py \
-    --file_id='test_image.jpg' \
-    --task_config='../diffusion-posterior-sampling/configs/style_extraction_config.yaml' \
-    --outdir='outputs/test' \
-    --prompt='oil painting' \
-    --omega=5 \
-    --ddim_steps=25
-```
+* Final image(s) in `--outdir`.
+* Intermediate predictions (optionally) logged every few steps.
+* If `tensorboard_logger` is available, the sampler logs:
 
-## 📊 Monitoring Progress
+  * sampling config, inner-loop losses, gradient norms, learning rates
+  * per-timestep preview images under `generation_progress/`
 
-### TensorBoard Visualization
-```bash
-# Start TensorBoard
-tensorboard --logdir=runs --port=6006
-
-# Open in browser: http://localhost:6006
-```
-
-### What You'll See
-- **Loss Curves**: Style constraint loss over time
-- **Learning Rates**: How the model adjusts during generation
-- **Image Progress**: Step-by-step generation process
-- **Metrics**: Gradient norms, parameter magnitudes
-
-## 🔧 Troubleshooting
-
-### Common Issues
-
-**"File not found" error**
-- Make sure your image is in the `pics/` directory
-- Check the filename matches exactly (case-sensitive)
-
-**Out of memory error**
-- Reduce `ddim_steps` (try 20-30)
-- Lower `omega` value (try 5-8)
-- Use CPU: add `--device=cpu` (slower but works)
-
-**Poor style transfer results**
-- Increase `omega` value (try 15-20)
-- Use more descriptive prompts
-- Increase `ddim_steps` for better quality
-
-**TensorBoard not showing data**
-- Check that `runs/` directory exists
-- Wait a few minutes for logs to appear
-- Try refreshing the browser
-
-### Performance Tips
-- **GPU**: Much faster than CPU (if available)
-- **Memory**: 4-8GB GPU memory recommended
-- **Storage**: Each run creates ~100MB of output files
-
-## 🎨 Style Examples
-
-Try these prompt styles for different effects:
-
-### Artistic Styles
-- `"van gogh painting with thick brushstrokes"`
-- `"picasso cubist style"`
-- `"monet impressionist painting"`
-- `"salvador dali surrealist art"`
-
-### Medium-Specific
-- `"watercolor painting with soft edges"`
-- `"oil painting with rich colors"`
-- `"pencil sketch with fine details"`
-- `"digital art with vibrant colors"`
-
-### Mood-Based
-- `"dark gothic art style"`
-- `"bright cheerful illustration"`
-- `"minimalist modern design"`
-- `"vintage retro aesthetic"`
-
-## 📈 Advanced Usage
-
-### Custom Configuration
-Edit `../diffusion-posterior-sampling/configs/style_extraction_config.yaml`:
-```yaml
-measurement:
-  operator:
-    name: clip_style_retrieval  # Style extraction method
-  noise: 
-    name: gaussian
-    sigma: 0.05  # Noise level (lower = cleaner)
-```
-
-### Batch Processing
-```bash
-# Process multiple images
-for image in pics/*.jpg; do
-    python scripts/inverse.py \
-        --file_id="$(basename "$image")" \
-        --task_config='../diffusion-posterior-sampling/configs/style_extraction_config.yaml' \
-        --outdir="outputs/batch_$(basename "$image" .jpg)" \
-        --prompt='your style description' \
-        --omega=10 \
-        --ddim_steps=50
-done
-```
-
-## 🤝 Contributing
-
-This repository implements PSLD (Posterior Sampling with Latent Diffusion) for style extraction. Key components:
-
-- **Style Extraction**: Uses CLIP to extract style features
-- **Diffusion Sampling**: Custom DDIM sampler with style constraints
-- **Constraint Optimization**: Cosine similarity loss for style matching
-- **Time Scheduling**: Late-strong scheduling for better results
-
-## 📄 License
-
-Please check the individual component licenses in the repository.
-
-## 🆘 Support
-
-If you encounter issues:
-1. Check the troubleshooting section above
-2. Verify your image is in the `pics/` directory
-3. Try reducing `omega` and `ddim_steps` values
-4. Check TensorBoard logs for detailed error information
-
-Happy style transferring! 🎨✨
+---
 
 
+## Citation & credits
+
+This project builds on Stable Diffusion (LDM) and incorporates ideas from **UGD** and **PSLD**. The CLIP-Gram operator is a simple differentiable descriptor (Gram of CLIP patch tokens, off-diagonals) used for single-image style transfer.
+
+---
+
+**Have fun stylizing!** 

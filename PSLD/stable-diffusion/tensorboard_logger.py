@@ -53,6 +53,97 @@ class PSLDTensorBoardLogger:
         
         self.step += 1
     
+    def log_text(self, tag, text, step=None):
+        """
+        Log text to TensorBoard.
+        
+        Args:
+            tag: Tag for the text in TensorBoard
+            text: Text string to log
+            step: Step number (if None, uses internal counter)
+        """
+        if step is None:
+            step = self.step
+        
+        self.writer.add_text(tag, text, step)
+    
+    def save_config_file(self, config_dict, filename="config.txt"):
+        """
+        Save configuration dictionary to a text file in the log directory.
+        
+        Args:
+            config_dict: Dictionary containing configuration parameters
+            filename: Name of the config file to save
+        """
+        import os
+        from datetime import datetime
+        
+        config_path = os.path.join(self.log_dir, filename)
+        
+        with open(config_path, 'w') as f:
+            f.write("=" * 80 + "\n")
+            f.write("EXPERIMENT CONFIGURATION\n")
+            f.write("=" * 80 + "\n\n")
+            f.write(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Log Directory: {self.log_dir}\n\n\n")
+            
+            # Group parameters by category
+            categories = {
+                'DDIM PARAMETERS': ['ddim_eta', 'ddim_steps'],
+                'FILE PARAMETERS': ['file_id'],
+                'GENERAL PARAMETERS': ['H', 'W', 'gamma', 'general_inverse', 'inpainting', 'omega', 'operator', 'prompt', 'scale', 'seed'],
+                'K PARAMETERS': ['k_recur'],
+                'N PARAMETERS': ['n_samples'],
+                'NORMALIZE PARAMETERS': ['normalize_grad'],
+                'OPTIM PARAMETERS': ['optim_forward_guidance', 'optim_forward_guidance_wt', 'optim_num_steps'],
+                'PATTERN PARAMETERS': ['pattern_type'],
+                'PSLD PARAMETERS': ['psld_weight'],
+                'SCHEDULE PARAMETERS': ['schedule_mode'],
+                'SPLIT PARAMETERS': ['split_timestep'],
+                'STYLE PARAMETERS': ['style_image'],
+                'TASK PARAMETERS': ['task_config'],
+                'UGD PARAMETERS': ['ugd_weight'],
+                'USE PARAMETERS': ['use_hybrid_sampler', 'use_unified_sampler']
+            }
+            
+            for category, params in categories.items():
+                f.write("=" * 80 + "\n")
+                f.write(f"{category}\n")
+                f.write("=" * 80 + "\n")
+                
+                for param in params:
+                    if param in config_dict:
+                        value = config_dict[param]
+                        # Format the parameter name and value nicely
+                        param_name = param.ljust(40)
+                        f.write(f"{param_name}: {value}\n")
+                
+                f.write("\n")
+        
+        print(f"Configuration saved to: {config_path}")
+    
+    def log_hyperparameters(self, config_dict, step=None):
+        """
+        Log hyperparameters to TensorBoard.
+        
+        Args:
+            config_dict: Dictionary containing hyperparameters
+            step: Step number (if None, uses internal counter)
+        """
+        if step is None:
+            step = self.step
+        
+        # Convert all values to strings for logging
+        hparams = {}
+        for key, value in config_dict.items():
+            if isinstance(value, (int, float, str, bool)):
+                hparams[key] = value
+            else:
+                hparams[key] = str(value)
+        
+        # Log hyperparameters to TensorBoard
+        self.writer.add_hparams(hparams, {})
+    
     def log_image(self, image_tensor, name="generated_image", step=None, every_n_steps=10):
         """
         Log image to TensorBoard every n steps.

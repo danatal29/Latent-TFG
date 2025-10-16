@@ -500,7 +500,7 @@ class CLIPStyleOperator(NonLinearOperator):
         # For CLIP, we'll use the final output features
         # CLIP doesn't provide intermediate layer access easily
         if features.dim() == 3:
-            # If we get [B, N, C] features
+            #If we get [B, N, C] features
             if use_adain:
                 # AdaIN normalization
                 mean = features.mean(dim=1, keepdim=True)
@@ -510,6 +510,7 @@ class CLIPStyleOperator(NonLinearOperator):
             else:
                 # Gram matrix
                 part = CLIPStyleOperator.gram(features, offdiag_only=True)
+            #part = features.reshape(features.shape[0], -1)
         else:
             # If features are 2D [B, C], flatten them
             part = features.reshape(features.shape[0], -1)

@@ -59,14 +59,14 @@ python scripts/inverse_ugd_dinov2.py \
     --prompt "A gondola gliding through the canals of Venice at night" \
     --style_image "${VANGOGH_STYLE}" \
     --file_id "starry_night_full.jpg" \
-    --task_config "${CONFIG_DIR}/style_extraction_config.yaml" \
+    --task_config "${CONFIG_DIR}/style_extraction_config_dino.yaml" \
     --diffusion_config "${CONFIG_DIR}/diffusion_config.yaml" \
     --model_config "${CONFIG_DIR}/model_config.yaml" \
     --config "${MODEL_CONFIG}" \
     --ckpt "${MODEL_CKPT}" \
     --ddim_steps 100 \
     --ddim_eta 0.0 \
-    --scale 7.0 \
+    --scale 10.0 \
     --omega 1.0 \
     --gamma 0.08 \
     --general_inverse 1 \
@@ -74,6 +74,8 @@ python scripts/inverse_ugd_dinov2.py \
     --optim_num_steps 8 \
     --optim_forward_guidance_wt 6.0 \
     --k_recur 4 \
+    --H 512 \
+    --W 512 \
     --normalize_grad \
     --outdir "${OUTPUT_DIR}/vangogh_pattern" \
     --seed 42

@@ -118,7 +118,7 @@ def check_safety(x_image):
     return x_checked_image, has_nsfw_concept
 
 
-def create_style_guidance_function(style_image_path, device, operator):
+def create_style_guidance_function(style_image_path, device, operator, H=512, W=512):
     """
     Create UGD style guidance function using PSLD's DINOv2 StyleOperator.
     
@@ -131,6 +131,8 @@ def create_style_guidance_function(style_image_path, device, operator):
         style_image_path: Path to style reference image
         device: torch device
         operator: PSLD DINOv2 StyleOperator from config
+        H: Image height for resizing (default 512)
+        W: Image width for resizing (default 512)
     
     Returns:
         style_guidance_fn: Function that computes style loss for UGD
@@ -188,9 +190,9 @@ def create_style_guidance_function(style_image_path, device, operator):
         style_tensor = style_tensor.unsqueeze(0)  # Add batch dim
         
         # Resize to proper dimensions if needed
-        if style_tensor.shape[-1] != 512 or style_tensor.shape[-2] != 512:
+        if style_tensor.shape[-1] != W or style_tensor.shape[-2] != H:
             style_tensor = torch.nn.functional.interpolate(
-                style_tensor, size=(512, 512), mode='bilinear', align_corners=False
+                style_tensor, size=(H, W), mode='bilinear', align_corners=False
             )
         
         # Extract target style features using DINOv2 operator
@@ -266,7 +268,7 @@ def create_ugd_guidance_config(opt, operator):
     
     if opt.style_image:
         print(f"🎨 Creating DINOv2 style guidance for: {opt.style_image}")
-        guidance_fn = create_style_guidance_function(opt.style_image, device, operator)
+        guidance_fn = create_style_guidance_function(opt.style_image, device, operator, opt.H, opt.W)
     else:
         print("⚠️  UGD guidance enabled but no style_image specified")
         print("📊 Falling back to standard PSLD")
@@ -366,13 +368,13 @@ def main():
     parser.add_argument(
         "--H",
         type=int,
-        default=512,
+        default=256,
         help="image height, in pixel space",
     )
     parser.add_argument(
         "--W",
         type=int,
-        default=512,
+        default=256,
         help="image width, in pixel space",
     )
     parser.add_argument(
