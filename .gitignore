@@ -4,6 +4,7 @@ cat > .gitignore <<'EOF'
 .vscode/
 .idea/
 .ipynb_checkpoints/
+.ipynb
 
 # Python
 __pycache__/
@@ -39,7 +40,7 @@ models/
 *.secrets
 .envrc
 EOF
-
+/runs/
 *.pt
 *.pth
 *.safetensors

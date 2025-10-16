@@ -53,6 +53,97 @@ class PSLDTensorBoardLogger:
         
         self.step += 1
     
+    def log_text(self, tag, text, step=None):
+        """
+        Log text to TensorBoard.
+        
+        Args:
+            tag: Tag for the text in TensorBoard
+            text: Text string to log
+            step: Step number (if None, uses internal counter)
+        """
+        if step is None:
+            step = self.step
+        
+        self.writer.add_text(tag, text, step)
+    
+    def save_config_file(self, config_dict, filename="config.txt"):
+        """
+        Save configuration dictionary to a text file in the log directory.
+        
+        Args:
+            config_dict: Dictionary containing configuration parameters
+            filename: Name of the config file to save
+        """
+        import os
+        from datetime import datetime
+        
+        config_path = os.path.join(self.log_dir, filename)
+        
+        with open(config_path, 'w') as f:
+            f.write("=" * 80 + "\n")
+            f.write("EXPERIMENT CONFIGURATION\n")
+            f.write("=" * 80 + "\n\n")
+            f.write(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Log Directory: {self.log_dir}\n\n\n")
+            
+            # Group parameters by category
+            categories = {
+                'DDIM PARAMETERS': ['ddim_eta', 'ddim_steps'],
+                'FILE PARAMETERS': ['file_id'],
+                'GENERAL PARAMETERS': ['H', 'W', 'gamma', 'general_inverse', 'inpainting', 'omega', 'operator', 'prompt', 'scale', 'seed'],
+                'K PARAMETERS': ['k_recur'],
+                'N PARAMETERS': ['n_samples'],
+                'NORMALIZE PARAMETERS': ['normalize_grad'],
+                'OPTIM PARAMETERS': ['optim_forward_guidance', 'optim_forward_guidance_wt', 'optim_num_steps'],
+                'PATTERN PARAMETERS': ['pattern_type'],
+                'PSLD PARAMETERS': ['psld_weight'],
+                'SCHEDULE PARAMETERS': ['schedule_mode'],
+                'SPLIT PARAMETERS': ['split_timestep'],
+                'STYLE PARAMETERS': ['style_image'],
+                'TASK PARAMETERS': ['task_config'],
+                'UGD PARAMETERS': ['ugd_weight'],
+                'USE PARAMETERS': ['use_hybrid_sampler', 'use_unified_sampler']
+            }
+            
+            for category, params in categories.items():
+                f.write("=" * 80 + "\n")
+                f.write(f"{category}\n")
+                f.write("=" * 80 + "\n")
+                
+                for param in params:
+                    if param in config_dict:
+                        value = config_dict[param]
+                        # Format the parameter name and value nicely
+                        param_name = param.ljust(40)
+                        f.write(f"{param_name}: {value}\n")
+                
+                f.write("\n")
+        
+        print(f"Configuration saved to: {config_path}")
+    
+    def log_hyperparameters(self, config_dict, step=None):
+        """
+        Log hyperparameters to TensorBoard.
+        
+        Args:
+            config_dict: Dictionary containing hyperparameters
+            step: Step number (if None, uses internal counter)
+        """
+        if step is None:
+            step = self.step
+        
+        # Convert all values to strings for logging
+        hparams = {}
+        for key, value in config_dict.items():
+            if isinstance(value, (int, float, str, bool)):
+                hparams[key] = value
+            else:
+                hparams[key] = str(value)
+        
+        # Log hyperparameters to TensorBoard
+        self.writer.add_hparams(hparams, {})
+    
     def log_image(self, image_tensor, name="generated_image", step=None, every_n_steps=10):
         """
         Log image to TensorBoard every n steps.
@@ -238,6 +329,53 @@ class PSLDTensorBoardLogger:
             'latent/max': z_max,
             'latent/min': z_min
         }, step)
+    
+    def log_scale_parameters(self, gamma_scale=None, unconditional_guidance_scale=None, 
+                           diffusion_timestep=None, total_steps=None, current_step=None, step=None):
+        """
+        Log scale-related parameters for PSLD diffusion process.
+        
+        Args:
+            gamma_scale: Gamma scaling factor (usually index/total_steps)
+            unconditional_guidance_scale: Unconditional guidance scale 
+            diffusion_timestep: Current diffusion timestep
+            total_steps: Total number of diffusion steps
+            current_step: Current step in the diffusion process
+            step: Step number for logging
+        """
+        if step is None:
+            step = self.step
+        
+        scale_metrics = {}
+        
+        if gamma_scale is not None:
+            if isinstance(gamma_scale, torch.Tensor):
+                gamma_scale = gamma_scale.item()
+            scale_metrics['scales/gamma_scale'] = gamma_scale
+        
+        if unconditional_guidance_scale is not None:
+            if isinstance(unconditional_guidance_scale, torch.Tensor):
+                unconditional_guidance_scale = unconditional_guidance_scale.item()
+            scale_metrics['scales/unconditional_guidance_scale'] = unconditional_guidance_scale
+        
+        if diffusion_timestep is not None:
+            if isinstance(diffusion_timestep, torch.Tensor):
+                diffusion_timestep = diffusion_timestep.item()
+            scale_metrics['scales/diffusion_timestep'] = diffusion_timestep
+        
+        if total_steps is not None:
+            scale_metrics['scales/total_steps'] = total_steps
+        
+        if current_step is not None:
+            scale_metrics['scales/current_step'] = current_step
+            
+        # Calculate progress ratio if both current_step and total_steps are available
+        if current_step is not None and total_steps is not None and total_steps > 0:
+            progress_ratio = current_step / total_steps
+            scale_metrics['scales/progress_ratio'] = progress_ratio
+        
+        if scale_metrics:
+            self.log_metrics(scale_metrics, step)
     
     def close(self):
         """Close the TensorBoard writer."""

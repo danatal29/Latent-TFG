@@ -198,20 +198,18 @@ class StyleOperator(NonLinearOperator):
         pil_img -> normalized style vector from multiple hidden states.
         `layers` are indices into hidden_states (negative = from the end).
         """
-        #inputs = self.processor(images=pil_img, return_tensors="pt").to(self.device)
+        # 1. Ensure batch dimension
+        if img_tensor.dim() == 3:
+            img_tensor = img_tensor.unsqueeze(0)  # Add batch dimension
         
-        # 1. Differentiable Resizing
+        # 2. Differentiable Resizing
         # DINOv2 expects a 224x224 input.
         # The image tensor is in the range [0, 1] after the clamp operation.
         # Use F.interpolate instead of T.Resize to avoid MPS issues
         if img_tensor.shape[-1] != 224 or img_tensor.shape[-2] != 224:
-            if img_tensor.dim() == 3:
-                img_tensor = img_tensor.unsqueeze(0)  # Add batch dimension
             img_tensor = F.interpolate(img_tensor, size=(224, 224), mode='bilinear', align_corners=False)
-            if img_tensor.shape[0] == 1:
-                img_tensor = img_tensor.squeeze(0)  # Remove batch dimension if it was added
 
-        # 2. Differentiable Normalization
+        # 3. Differentiable Normalization
         # DINOv2's mean and std
         norm_mean = torch.tensor([0.485, 0.456, 0.406], device=img_tensor.device).view(1, 3, 1, 1)
         norm_std = torch.tensor([0.229, 0.224, 0.225], device=img_tensor.device).view(1, 3, 1, 1)
@@ -219,11 +217,8 @@ class StyleOperator(NonLinearOperator):
         # Apply normalization to the tensor
         inputs = (img_tensor - norm_mean) / norm_std
 
-        # Ensure we have batch dimension
-        if inputs.dim() == 3:
-            inputs = inputs.unsqueeze(0)  # [C, H, W] -> [1, C, H, W]
-
-        if img_tensor.requires_grad:
+        # 4. Forward pass through DINOv2
+        if inputs.requires_grad:
             out = self.model(inputs, output_hidden_states=True)
         else:
             with torch.no_grad():
@@ -249,16 +244,8 @@ class StyleOperator(NonLinearOperator):
     def forward(self, data, **kwargs):
         # For differentiable operations, we need to handle tensors directly
         if torch.is_tensor(data):
-
-            #data = torch.clamp((data + 1.0) / 2.0, min=0.0, max=1.0)
-
             # Convert from [-1, 1] to [0, 1] range without reshaping
             data = data.add(1.0).div(2.0).clamp(0.0, 1.0)
-            
-            # For differentiable style extraction, we'll use a simplified approach
-            # that maintains the computational graph
-            if data.dim() == 3:
-                data = data.unsqueeze(0) 
             
             # Use a differentiable style extraction method
             style_vec = self.style_vec(data, **kwargs)
@@ -435,7 +422,8 @@ class CLIPStyleOperator(NonLinearOperator):
         # Import CLIP model and processor
         import clip
         self.model, self.preprocess = clip.load("ViT-B/32", device=self.device)
-        self.model = self.model.eval()
+        # DON'T put the full model in eval mode - we need gradients to flow
+        # self.model = self.model.eval()
         
         # Get the image encoder part
         self.image_encoder = self.model.visual
@@ -443,9 +431,13 @@ class CLIPStyleOperator(NonLinearOperator):
         # Convert to float32 to avoid MPS type mismatches
         self.image_encoder = self.image_encoder.float()
         
-        # Freeze the model parameters
+        # Freeze the model parameters BUT allow gradients to flow through
         for param in self.image_encoder.parameters():
             param.requires_grad = False
+            
+        # CRITICAL: Set model to training mode to allow gradients to flow
+        # Even though parameters are frozen, gradients need to flow for style loss
+        self.image_encoder.train()
 
     @staticmethod
     def gram(tokens, offdiag_only=True):
@@ -485,46 +477,56 @@ class CLIPStyleOperator(NonLinearOperator):
         # Ensure we have batch dimension
         if inputs.dim() == 3:
             inputs = inputs.unsqueeze(0)  # [C, H, W] -> [1, C, H, W]
-
-        # Extract features from CLIP
-        if img_tensor.requires_grad:
-            # Get features from CLIP - use the standard forward pass
-            features = self.image_encoder(inputs)
             
-            # For CLIP, we'll use the final output features
-            # CLIP doesn't provide intermediate layer access easily
-            if features.dim() == 3:
-                # If we get [B, N, C] features
-                if use_adain:
-                    # AdaIN normalization
-                    mean = features.mean(dim=1, keepdim=True)
-                    std = features.std(dim=1, keepdim=True) + 1e-8
-                    part = (features - mean) / std
-                    part = part.reshape(part.shape[0], -1)
-                else:
-                    # Gram matrix
-                    part = CLIPStyleOperator.gram(features, offdiag_only=True)
-            else:
-                # If features are 2D [B, C], flatten them
-                part = features.reshape(features.shape[0], -1)
-                
-        else:
-            with torch.no_grad():
-                features = self.image_encoder(inputs)
-                
-                if features.dim() == 3:
-                    if use_adain:
-                        mean = features.mean(dim=1, keepdim=True)
-                        std = features.std(dim=1, keepdim=True) + 1e-8
-                        part = (features - mean) / std
-                        part = part.reshape(part.shape[0], -1)
-                    else:
-                        part = CLIPStyleOperator.gram(features, offdiag_only=True)
-                else:
-                    part = features.reshape(features.shape[0], -1)
+        # CRITICAL: Explicitly enable gradients on the input tensor
+        if img_tensor.requires_grad:
+            inputs = inputs.requires_grad_(True)
+            print(f"Debug CLIP - Explicitly enabled gradients on inputs: {inputs.requires_grad}")
 
-        # Return normalized features
-        return F.normalize(part, dim=1)
+        # Extract features from CLIP - ALWAYS preserve gradients for optimization
+        # Even though CLIP parameters are frozen, we need gradients to flow through for style loss
+        
+        # Ensure CLIP encoder is in training mode if we need gradients
+        if inputs.requires_grad:
+            self.image_encoder.train()
+            print(f"Debug CLIP - image_encoder.training: {self.image_encoder.training}")
+        
+        features = self.image_encoder(inputs)
+        
+        # Debug gradient flow
+        print(f"Debug CLIP - inputs.requires_grad: {inputs.requires_grad}")
+        print(f"Debug CLIP - features.requires_grad: {features.requires_grad}")
+        
+        # For CLIP, we'll use the final output features
+        # CLIP doesn't provide intermediate layer access easily
+        if features.dim() == 3:
+            #If we get [B, N, C] features
+            if use_adain:
+                # AdaIN normalization
+                mean = features.mean(dim=1, keepdim=True)
+                std = features.std(dim=1, keepdim=True) + 1e-8
+                part = (features - mean) / std
+                part = part.reshape(part.shape[0], -1)
+            else:
+                # Gram matrix
+                part = CLIPStyleOperator.gram(features, offdiag_only=True)
+            #part = features.reshape(features.shape[0], -1)
+        else:
+            # If features are 2D [B, C], flatten them
+            part = features.reshape(features.shape[0], -1)
+
+        # Return normalized features with gradients preserved
+        normalized_part = F.normalize(part, dim=1)
+        
+        # Debug final output
+        print(f"Debug CLIP - normalized_part.requires_grad: {normalized_part.requires_grad}")
+        
+        # FAILSAFE: If gradients are lost, try to restore them
+        if not normalized_part.requires_grad and inputs.requires_grad:
+            print("WARNING: Gradients lost in CLIP - attempting to restore")
+            normalized_part = normalized_part.requires_grad_(True)
+            
+        return normalized_part
 
     def forward(self, data, **kwargs):
         if torch.is_tensor(data):

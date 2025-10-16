@@ -36,10 +36,12 @@ class DDIMSampler(object):
                 experiment_name="psld_style_constraint"
             )
             self.log_step = 0
+            self.reference_image_logged = False  # Track if we've logged reference image
         except ImportError:
             print("Warning: tensorboard_logger not available, logging disabled")
             self.tensorboard_logger = None
             self.log_step = 0
+            self.reference_image_logged = False
 
     def register_buffer(self, name, attr):
         if type(attr) == torch.Tensor:
@@ -111,9 +113,40 @@ class DDIMSampler(object):
                ip_mask = None, measurements = None, operator = None, gamma = 1, inpainting = False, omega=1,
                general_inverse = None, noiser=None,
                ffhq256=False,
+               reference_image=None,
                # this has to come in the same format as the conditioning, # e.g. as encoded tokens, ...
                **kwargs
                ):
+        # Log reference image to TensorBoard (once per sampling session)
+        if (reference_image is not None and 
+            self.tensorboard_logger is not None and 
+            not self.reference_image_logged):
+            
+            ref_img = reference_image.clone()
+            
+            # Move to correct device if needed
+            if hasattr(self.model, 'device'):
+                device = self.model.device
+            elif hasattr(self, 'device'):
+                device = self.device
+            else:
+                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                
+            if ref_img.device != device:
+                ref_img = ref_img.to(device)
+            
+            # Ensure 3D (CHW)
+            if ref_img.dim() == 4:
+                ref_img = ref_img[0]  # Take first image if batch
+            
+            # Log the reference image
+            self.tensorboard_logger.log_image(ref_img, 
+                                            name="reference_image", 
+                                            step=0, 
+                                            every_n_steps=1)
+            self.reference_image_logged = True
+            print(f"📸 Logged reference image to TensorBoard")
+
         if conditioning is not None:
             if isinstance(conditioning, dict):
                 cbs = conditioning[list(conditioning.keys())[0]].shape[0]
@@ -222,7 +255,7 @@ class DDIMSampler(object):
                       ip_mask=None, measurements = None, operator = None, gamma=1, inpainting=False,
                       gamma_scale = None, omega = 1e-1,
                       general_inverse=False,noiser=None,
-                      ffhq256=False):
+                      ffhq256=False, total_steps=None):
         b, *_, device = *x.shape, x.device
            
         ##########################################
@@ -231,9 +264,15 @@ class DDIMSampler(object):
 
         
         if general_inverse:
-            # print('Running general inverse module...')
+            print(f"🔍 DEBUG - Running PSLD constraint optimization...")
+            print(f"🔍 DEBUG - general_inverse: {general_inverse}")
+            print(f"🔍 DEBUG - operator: {operator}")
+            print(f"🔍 DEBUG - measurements: {measurements is not None}")
+            print(f"🔍 DEBUG - gamma: {gamma}, omega: {omega}")
+            
             z_t = torch.clone(x.detach())
             z_t.requires_grad = True
+            print(f"🔍 DEBUG - z_t.requires_grad: {z_t.requires_grad}")
             
             if unconditional_conditioning is None or unconditional_guidance_scale == 1.:
                 e_t = self.model.apply_model(z_t, t, c)
@@ -285,10 +324,23 @@ class DDIMSampler(object):
                                 ('style' in operator.__class__.__name__.lower() or 
                                  'StyleOperator' in operator.__class__.__name__))
             
+            # Debug: Check operator detection
+            print(f"🔍 DEBUG - Operator class: {operator.__class__.__name__}")
+            print(f"🔍 DEBUG - Is style operator: {is_style_operator}")
+            print(f"🔍 DEBUG - Operator name contains 'style': {'style' in operator.__class__.__name__.lower()}")
+            print(f"🔍 DEBUG - Operator name contains 'StyleOperator': {'StyleOperator' in operator.__class__.__name__}")
+            
             if not is_style_operator:
                 # For non-style operators: get measurement prediction and add noise
+                print(f"🔍 DEBUG - Using NON-STYLE operator path")
+                print(f"🔍 DEBUG - measurements shape: {measurements.shape}")
+                print(f"🔍 DEBUG - measurements type: {type(measurements)}")
+                
                 meas_pred = operator.forward(image_pred)
                 meas_pred = noiser(meas_pred)
+                
+                print(f"🔍 DEBUG - meas_pred shape: {meas_pred.shape}")
+                print(f"🔍 DEBUG - meas_pred.requires_grad: {meas_pred.requires_grad}")
 
 
             # Handle style operators
@@ -299,29 +351,83 @@ class DDIMSampler(object):
                 # Extract target style features from measurements (these are the target style vectors)
                 target_style_features = measurements.detach()
                 
+                # Debug: Check measurements and target features
+                print(f"🔍 DEBUG - measurements shape: {measurements.shape}")
+                print(f"🔍 DEBUG - measurements type: {type(measurements)}")
+                print(f"🔍 DEBUG - target_style_features shape: {target_style_features.shape}")
+                print(f"🔍 DEBUG - target_style_features.requires_grad: {target_style_features.requires_grad}")
+                
                 # Extract style features from the predicted image using the same method
                 pred_style_features = operator.forward(image_pred)
                 
+                # Debug: Check predicted features
+                print(f"🔍 DEBUG - pred_style_features shape: {pred_style_features.shape}")
+                print(f"🔍 DEBUG - pred_style_features.requires_grad: {pred_style_features.requires_grad}")
+                
                 # Compute cosine similarity loss for style features
-                # Normalize features for cosine similarity
-                pred_norm = F.normalize(pred_style_features, dim=-1)
-                target_norm = F.normalize(target_style_features, dim=-1)
+                # Normalize features for cosine similarity - make sure this preserves gradients
+                pred_norm = F.normalize(pred_style_features, p=2, dim=-1)
+                target_norm = F.normalize(target_style_features, p=2, dim=-1)
                 
-                # Cosine similarity loss (1 - cosine_similarity)
+                # Debug normalization gradients
+                print(f"Debug - pred_norm.requires_grad: {pred_norm.requires_grad}")
+                
+                # Cosine similarity loss (1 - cosine_similarity) - use manual computation to ensure gradients
+                # cosine_sim = (pred_norm * target_norm).sum(dim=-1)  # Manual cosine similarity
                 cosine_sim = F.cosine_similarity(pred_norm, target_norm, dim=-1)
-                cosine_loss = (1.0 - cosine_sim).mean()  # Scale up cosine loss
+                cosine_loss = (1.0 - cosine_sim).mean()
                 
-                # Add L2 regularization to prevent overfitting
+                # Debug cosine loss gradients
+                print(f"Debug - cosine_sim.requires_grad: {cosine_sim.requires_grad}")
+                print(f"Debug - cosine_loss.requires_grad: {cosine_loss.requires_grad}")
+                
+                # Add L2 regularization to prevent overfitting  
                 l2_reg = 0.1 * torch.norm(pred_style_features - target_style_features, p=2)
                 
                 # Combine both losses for better style transfer
                 style_loss = cosine_loss #+ l2_reg
                 
+                # CRITICAL: Ensure style_loss has gradients
+                if not style_loss.requires_grad:
+                    print(f"❌ WARNING: style_loss lost gradients! cosine_loss.requires_grad = {cosine_loss.requires_grad}")
+                    print(f"   pred_style_features.requires_grad = {pred_style_features.requires_grad}")
+                    print(f"   pred_norm.requires_grad = {pred_norm.requires_grad}")
+                    print(f"   cosine_sim.requires_grad = {cosine_sim.requires_grad}")
+                    
+                    # FAILSAFE: Create a differentiable style loss
+                    if pred_style_features.requires_grad:
+                        print("🔧 Attempting to recreate differentiable style loss...")
+                        # Use MSE loss as backup that preserves gradients
+                        style_loss = torch.nn.functional.mse_loss(
+                            F.normalize(pred_style_features, dim=-1),
+                            F.normalize(target_style_features, dim=-1)
+                        )
+                        print(f"   Recreated style_loss.requires_grad = {style_loss.requires_grad}")
+                    else:
+                        raise RuntimeError("Cannot create differentiable style loss - pred_style_features has no gradients!")
+                
                 print(f'***Cosine similarity: {cosine_sim.mean().item():.3f}, Cosine loss: {style_loss.item():.3f}, L2 reg: {l2_reg.item():.3f}')
 
-                # 3) Time schedule on omega (late-strong)
-                omega_t = omega * a_t.pow(2)                                 # a_t = alphas[index]
-                error   = omega * style_loss
+                # # 3) Time schedule on omega (late-strong)
+                # omega_t = omega * (1-a_t).sqrt()                               # a_t = alphas[index]
+                # error = omega_t * style_loss
+
+
+                #log SNR
+                logsnr_t = torch.log(a_t / (1 - a_t + 1e-8))
+                # pick mid around 0 dB -> a_t ≈ 0.5, and a sharpness k in [3,7]
+                m = torch.tensor(0.0, device=a_t.device)  # midpoint (logSNR=0)
+                k = 5.0                                    # steeper -> later/stronger
+
+                w_t = torch.sigmoid(k * (logsnr_t - m))    # in (0,1), monotone with denoising progress
+                omega_t = omega * w_t.clamp(0.0, 1.0)
+                error = omega_t * style_loss
+
+
+                
+                # Debug final error tensor
+                print(f"Debug - omega_t.requires_grad: {omega_t.requires_grad}")
+                print(f"Debug - final error.requires_grad: {error.requires_grad}")
                 
                 print(f'Style loss: {style_loss.item():.4f}, Omega_t: {omega_t.item():.4f}')
                 
@@ -342,8 +448,19 @@ class DDIMSampler(object):
                 inpaint_error = torch.linalg.norm(encoded_z_0 - pred_z_0)
                 
                 error = inpaint_error * gamma + meas_error * omega
+                
+                # Debug gradient flow for non-style operators
+                print(f"Debug - meas_error.requires_grad: {meas_error.requires_grad}")
+                print(f"Debug - inpaint_error.requires_grad: {inpaint_error.requires_grad}")
+                print(f"Debug - final error.requires_grad: {error.requires_grad}")
             
-            gradients = torch.autograd.grad(error, inputs=z_t,  retain_graph=False)[0]
+            # Safety check before computing gradients
+            if not z_t.requires_grad:
+                raise RuntimeError(f"z_t does not require gradients! z_t.requires_grad = {z_t.requires_grad}")
+            if not error.requires_grad:
+                raise RuntimeError(f"error does not require gradients! error.requires_grad = {error.requires_grad}")
+                
+            gradients = torch.autograd.grad(error, inputs=z_t, retain_graph=False)[0]
             
             # Adaptive learning rate based on gradient-to-parameter ratio
             grad_norm = gradients.norm()
@@ -359,17 +476,19 @@ class DDIMSampler(object):
 
             # Debug learning rate calculation
 
-            # Apply gradient update
-            lr = (omega_t).clamp(0.3, 3).item()
+            # Apply gradient update with balanced learning rate for effective but stable constraint enforcement
+            lr = (omega_t).clamp(0.1, 10).item()  # Scale up by 100x for balanced style constraint
             z_prev = z_prev - lr * normalized_gradients
 
             
             
             # Calculate actual step size for monitoring
+            actual_step_size = lr * normalized_gradients.norm()
             
-            print(f'Gradients: {gradients.norm().item():.6f}, Z_PREV: {z_prev.norm().item():.6f}')
-            print(f'Learning Rate: {lr:.3f}, Step Size: {step_size_t.item():.3f}')
-            print(f'Loss: {error.item():.6f}')
+            print(f'🔍 DEBUG - PSLD Optimization Step:')
+            print(f'   Gradients: {gradients.norm().item():.6f}, Z_PREV: {z_prev.norm().item():.6f}')
+            print(f'   Learning Rate: {lr:.3f} (omega_t*100), Actual Step Size: {actual_step_size:.6f}')
+            print(f'   Loss: {error.item():.6f}, Omega_t: {omega_t.item():.6f}')
             
             # Log metrics (handle both style and non-style operators)
             if self.tensorboard_logger is not None:
@@ -389,6 +508,16 @@ class DDIMSampler(object):
                     metrics_to_log['loss/style_loss'] = style_loss.item()
                 
                 self.tensorboard_logger.log_metrics(metrics_to_log, step=self.log_step)
+                
+                # Log scale parameters
+                self.tensorboard_logger.log_scale_parameters(
+                    gamma_scale=gamma_scale,
+                    unconditional_guidance_scale=unconditional_guidance_scale,
+                    diffusion_timestep=t.item() if hasattr(t, 'item') else t,
+                    total_steps=total_steps,
+                    current_step=index,
+                    step=self.log_step
+                )
                 # Log images every 10 steps
                 if self.log_step % 10 == 0:
                     current_image = self.model.differentiable_decode_first_stage(pred_z_0)
@@ -442,6 +571,18 @@ class DDIMSampler(object):
                 noise = torch.nn.functional.dropout(noise, p=noise_dropout)
             x_prev = a_prev.sqrt() * pred_x0 + dir_xt + noise
 
+            # Log scale parameters for regular diffusion path
+            if self.tensorboard_logger is not None:
+                self.tensorboard_logger.log_scale_parameters(
+                    gamma_scale=gamma_scale,
+                    unconditional_guidance_scale=unconditional_guidance_scale,
+                    diffusion_timestep=t.item() if hasattr(t, 'item') else t,
+                    total_steps=total_steps,
+                    current_step=index,
+                    step=self.log_step
+                )
+                self.log_step += 1
+
             return x_prev, pred_x0
     
     ######################
@@ -483,5 +624,6 @@ class DDIMSampler(object):
             ts = torch.full((x_latent.shape[0],), step, device=x_latent.device, dtype=torch.long)
             x_dec, _ = self.p_sample_ddim(x_dec, cond, ts, index=index, use_original_steps=use_original_steps,
                                           unconditional_guidance_scale=unconditional_guidance_scale,
-                                          unconditional_conditioning=unconditional_conditioning)
+                                          unconditional_conditioning=unconditional_conditioning,
+                                          total_steps=total_steps)
         return x_dec

@@ -9,7 +9,7 @@ data:
 
 measurement:
   operator:
-    name: clip_style_retrieval  #style_retrieval
+    name: style_retrieval  #style_retrieval
     #in_shape: !!python/tuple [1, 3, 512, 512]
     #scale_factor: 1
   
