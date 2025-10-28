@@ -1,0 +1,91 @@
+# Configuration for UGD-PSLD Integrated Style Transfer
+
+# Model configuration
+model:
+  base_config: "/workspace/Universal-Guided-Diffusion/stable-diffusion-guided/configs/stable-diffusion/v1-inference.yaml"
+  checkpoint: "/workspace/Universal-Guided-Diffusion/stable-diffusion-guided/models/ldm/stable-diffusion-v1/model.ckpt"
+
+# Sampling configuration
+sampling:
+  num_steps: 50
+  eta: 0.0
+  temperature: 1.0
+  batch_size: 1
+
+# Guidance configuration
+guidance:
+  # Mode can be: "ugd", "psld", "hybrid", "none"
+  mode: "hybrid"
+  
+  # UGD (Universal Guided Diffusion) settings
+  ugd:
+    enabled: true
+    clip_model: "RN50"  # Options: "RN50", "RN101", "ViT-B/32", "ViT-B/16"
+    clip_weight: 1.0
+    forward_guidance: true
+    backward_guidance: true
+    num_optimization_steps: 1
+    optimization_lr: 0.001
+    
+  # PSLD (Posterior Sampling for Latent Diffusion) settings
+  psld:
+    enabled: true
+    method: "ps"  # Options: "ps", "ps+", "mcg", "projection"
+    scale: 1.0
+    weight: 0.5
+    num_sampling: 5  # For ps+ method
+    operator_type: "style"  # Type of measurement operator
+    
+  # Hybrid settings
+  hybrid:
+    guidance_scale: 100.0
+    balance_factor: 0.5  # Balance between UGD and PSLD (0=full PSLD, 1=full UGD)
+    adaptive_weighting: true  # Dynamically adjust weights based on timestep
+    
+# Classifier-free guidance
+cfg:
+  scale: 7.5
+  use_unconditional: true
+
+# Style transfer specific settings
+style_transfer:
+  # Style extraction settings
+  style_layers: ["relu1_1", "relu2_1", "relu3_1", "relu4_1", "relu5_1"]
+  content_layers: ["relu4_2"]
+  style_weight: 1000.0
+  content_weight: 1.0
+  
+  # Augmentation for style robustness
+  augmentation:
+    enabled: true
+    random_crop: true
+    color_jitter: true
+    
+  # Multi-scale style transfer
+  multiscale:
+    enabled: false
+    scales: [0.5, 1.0, 2.0]
+    
+# Output settings
+output:
+  save_intermediate: false
+  intermediate_steps: [10, 20, 30, 40]
+  format: "png"
+  quality: 95
+
+# Advanced settings
+advanced:
+  # Memory optimization
+  use_fp16: false
+  gradient_checkpointing: false
+  
+  # Noise scheduling
+  noise_schedule: "linear"  # Options: "linear", "cosine", "quadratic"
+  
+  # Optimization
+  optimizer: "Adam"  # Options: "Adam", "AdamW", "SGD"
+  lr_scheduler: "constant"  # Options: "constant", "linear", "cosine"
+  
+  # Regularization
+  tv_loss_weight: 0.0
+  l2_reg_weight: 0.0
